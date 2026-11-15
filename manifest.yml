@@ -1,0 +1,24 @@
+modules:
+  jira:issuePanel:
+    - key: recuerdo-hello-world-issue-panel
+      resource: main
+      resolver:
+        function: resolver
+      render: native
+      title: recuerdo
+      icon: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
+  function:
+    - key: resolver
+      handler: index.handler
+resources:
+  - key: main
+    path: src/frontend/index.jsx
+permissions:
+  scopes:
+    - read:jira-work
+app:
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/c80df87c-dea4-4b3f-933a-79865f287f6f
