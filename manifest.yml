@@ -16,6 +16,10 @@ resources:
 permissions:
   scopes:
     - read:jira-work
+  external:
+    fetch:
+      backend:
+        - "jzklkfdx7cqzgy2rjx3wcfsmte0xewuz.lambda-url.ap-southeast-2.on.aws"
 app:
   runtime:
     name: nodejs24.x
