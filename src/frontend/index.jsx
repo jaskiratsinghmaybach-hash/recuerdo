@@ -51,22 +51,28 @@ const App = () => {
   const [refreshing, setRefreshing] = useState(false);
   const [activeCitation, setActiveCitation] = useState(null); // marker number, or null if closed
 
-  const loadContext = useCallback((key) => {
-    return invoke("getIssueContext", { issueKey: key }).then(setContext);
+  const loadContext = useCallback((key, forceRefresh) => {
+    return invoke("getIssueContext", { issueKey: key, forceRefresh }).then(
+      setContext,
+    );
   }, []);
 
   useEffect(() => {
     view.getContext().then((ctx) => {
       const key = ctx.extension.issue.key;
       setIssueKey(key);
-      loadContext(key);
+      // Initial load: never forces a refresh. If a cached AI result exists
+      // from a previous session, the resolver returns it instantly with no
+      // new AI call — the summary only regenerates when the user explicitly
+      // clicks Refresh below.
+      loadContext(key, false);
     });
   }, [loadContext]);
 
   const handleRefresh = async () => {
     if (!issueKey || refreshing) return;
     setRefreshing(true);
-    await loadContext(issueKey);
+    await loadContext(issueKey, true);
     setRefreshing(false);
   };
 
