@@ -45,22 +45,15 @@ resolver.define("getIssueContext", async (req) => {
     const resolution = issue.fields?.resolution?.name || null;
     const description = extractTextFromADF(issue.fields?.description);
 
-    // Jira's own "self" URL on the issue is a full REST API URL, e.g.
-    // "https://one-atlas-xltb.atlassian.net/rest/api/3/issue/12345". The
-    // site's browsable base URL is everything before "/rest/api/...", which
-    // we need to build a real "View in Jira" link for each citation.
-    const siteBaseUrl = (issue.self || "").split("/rest/api/")[0];
-
-    // Build a single numbered list of everything the AI is allowed to cite.
-    // This is the one place that knows about "sources" as a concept — if we
-    // add attachments, Confluence pages, etc. later, they just get appended
-    // here and everything downstream (prompt, frontend) keeps working as-is.
-    const sources = buildSourceList({
-      issueKey,
-      siteBaseUrl,
-      description,
-      comments,
-    });
+    // NOTE: we deliberately do NOT build a full browsable URL here. Jira's
+    // own "self" field on the issue/comment objects can be an internal
+    // api.atlassian.com proxy URL rather than the real public site domain
+    // (e.g. https://api.atlassian.com/ex/jira/<cloudId>/rest/api/3/...),
+    // which produces a broken link if used directly. The frontend's
+    // view.getContext() call already returns a reliable siteUrl for the
+    // real domain, so each source only carries the relative piece
+    // (focusedCommentId, if any) and the frontend builds the full URL.
+    const sources = buildSourceList({ description, comments });
 
     // Once the AI has generated a result for this issue, it should STAY as
     // is until the user explicitly clicks Refresh — not regenerate on every
@@ -114,22 +107,20 @@ resolver.define("getIssueContext", async (req) => {
 // (1-based) is exactly the citation marker number the AI will use, and what
 // the frontend looks up when the user clicks a [n] marker.
 //
-// Each source carries a jiraUrl: for a comment, a real deep link
-// (?focusedCommentId=<id>) that jumps to and highlights that exact comment
-// on the native Jira issue page when opened in a new tab (opening in the
-// same tab is a known Jira Cloud limitation — see JRACLOUD-77216 — so the
-// frontend always opens this in a new tab). The description has no
-// equivalent anchor, so it just links to the issue itself.
-function buildSourceList({ issueKey, siteBaseUrl, description, comments }) {
+// Each comment source carries commentId (Jira's real comment id). The
+// frontend combines this with its own siteUrl (from view.getContext()) and
+// the issue key to build the full "View in Jira" deep link
+// (?focusedCommentId=<id>), opened in a new tab — same-tab navigation to a
+// focusedCommentId is a known Jira Cloud limitation (JRACLOUD-77216).
+function buildSourceList({ description, comments }) {
   const sources = [];
-  const issueUrl = `${siteBaseUrl}/browse/${issueKey}`;
 
   if (description) {
     sources.push({
       type: "description",
       label: "Issue description",
       text: description,
-      jiraUrl: issueUrl,
+      commentId: null,
     });
   }
 
@@ -138,7 +129,7 @@ function buildSourceList({ issueKey, siteBaseUrl, description, comments }) {
       type: "comment",
       label: `Comment ${i + 1} — ${c.author}`,
       text: c.text,
-      jiraUrl: c.id ? `${issueUrl}?focusedCommentId=${c.id}` : issueUrl,
+      commentId: c.id || null,
     });
   });
 

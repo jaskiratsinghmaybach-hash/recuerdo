@@ -57,6 +57,7 @@ function splitSummaryIntoParts(summary) {
 const App = () => {
   const [context, setContext] = useState(null);
   const [issueKey, setIssueKey] = useState(null);
+  const [siteUrl, setSiteUrl] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [activeCitation, setActiveCitation] = useState(null); // marker number, or null if closed
 
@@ -70,6 +71,11 @@ const App = () => {
     view.getContext().then((ctx) => {
       const key = ctx.extension.issue.key;
       setIssueKey(key);
+      // siteUrl is Forge's own reliable site domain (e.g.
+      // https://one-atlas-xltb.atlassian.net) — unlike the Jira REST API's
+      // "self" fields, which can point at an internal api.atlassian.com
+      // proxy URL instead. We use this to build correct "View in Jira" links.
+      setSiteUrl(ctx.siteUrl);
       // Initial load: never forces a refresh. If a cached AI result exists
       // from a previous session, the resolver returns it instantly with no
       // new AI call — the summary only regenerates when the user explicitly
@@ -107,6 +113,15 @@ const App = () => {
   const activeReason = activeCitation
     ? citations.find((c) => c.marker === activeCitation)?.reason
     : null;
+
+  // Built here, not in the resolver, because siteUrl (Forge's own reliable
+  // site domain) is only available on the frontend via view.getContext().
+  const activeJiraUrl =
+    activeSource && siteUrl && issueKey
+      ? activeSource.commentId
+        ? `${siteUrl}/browse/${issueKey}?focusedCommentId=${activeSource.commentId}`
+        : `${siteUrl}/browse/${issueKey}`
+      : null;
 
   return (
     <Stack space="space.200">
@@ -199,9 +214,9 @@ const App = () => {
               </Stack>
             </ModalBody>
             <ModalFooter>
-              {activeSource.jiraUrl && (
+              {activeJiraUrl && (
                 <LinkButton
-                  href={activeSource.jiraUrl}
+                  href={activeJiraUrl}
                   target="_blank"
                   appearance="default"
                 >
