@@ -5,10 +5,11 @@ import ForgeReconciler, {
   Inline,
   Lozenge,
   SectionMessage,
-  Strong,
   Heading,
   Button,
+  LinkButton,
   Pressable,
+  Icon,
   Modal,
   ModalBody,
   ModalHeader,
@@ -17,6 +18,14 @@ import ForgeReconciler, {
   ModalTransition,
 } from "@forge/react";
 import { invoke, view } from "@forge/bridge";
+
+// Which icon glyph represents each source type in an inline citation marker.
+// Falls back to 'link' for any future source type we haven't special-cased.
+function iconGlyphForSourceType(type) {
+  if (type === "comment") return "comment";
+  if (type === "description") return "document";
+  return "link";
+}
 
 // Splits a summary string like "Tokens expired early [3] due to a TTL change [1]."
 // into plain text segments and citation marker numbers, in order, so we can
@@ -129,23 +138,30 @@ const App = () => {
         {(hasComments || context.description) && context.aiSummary && (
           <SectionMessage appearance="information">
             <Text>
-              {summaryParts.map((part, i) =>
-                part.type === "text" ? (
+              {summaryParts.map((part, i) => {
+                if (part.type === "text") {
                   // Plain string, not wrapped in another Text — keeps it
                   // flowing inline with the citation markers on either side
                   // instead of each fragment becoming its own block/line.
-                  part.value
-                ) : (
+                  return part.value;
+                }
+                const matchedSource = sources[part.marker - 1];
+                const glyph = iconGlyphForSourceType(matchedSource?.type);
+                return (
                   <Pressable
                     key={i}
                     onClick={() => setActiveCitation(part.marker)}
                     padding="space.0"
                     backgroundColor="color.background.neutral.subtle"
                   >
-                    {`[${part.marker}]`}
+                    <Icon
+                      glyph={glyph}
+                      label={`View citation source: ${matchedSource?.label || "source"}`}
+                      size="small"
+                    />
                   </Pressable>
-                ),
-              )}
+                );
+              })}
             </Text>
           </SectionMessage>
         )}
@@ -162,20 +178,6 @@ const App = () => {
           !context.aiSummary &&
           !context.aiError && <Text>No summary available.</Text>}
       </Stack>
-
-      {hasComments && (
-        <Stack space="space.075">
-          <Heading size="small">Comments ({context.comments.length})</Heading>
-          {context.comments.map((c, i) => (
-            <Text key={i}>
-              <Strong>
-                Comment {i + 1} — {c.author}:
-              </Strong>{" "}
-              {c.text}
-            </Text>
-          ))}
-        </Stack>
-      )}
 
       <ModalTransition>
         {activeCitation && activeSource && (
@@ -197,6 +199,15 @@ const App = () => {
               </Stack>
             </ModalBody>
             <ModalFooter>
+              {activeSource.jiraUrl && (
+                <LinkButton
+                  href={activeSource.jiraUrl}
+                  target="_blank"
+                  appearance="default"
+                >
+                  View in Jira
+                </LinkButton>
+              )}
               <Button
                 appearance="subtle"
                 onClick={() => setActiveCitation(null)}

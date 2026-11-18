@@ -33,6 +33,7 @@ resolver.define("getIssueContext", async (req) => {
     const commentsData = await commentsRes.json();
 
     const comments = (commentsData.comments || []).map((c) => ({
+      id: c.id,
       author: c.author?.displayName || "Unknown",
       created: c.created,
       // body is Atlassian Document Format (ADF); extract plain text
@@ -44,11 +45,22 @@ resolver.define("getIssueContext", async (req) => {
     const resolution = issue.fields?.resolution?.name || null;
     const description = extractTextFromADF(issue.fields?.description);
 
+    // Jira's own "self" URL on the issue is a full REST API URL, e.g.
+    // "https://one-atlas-xltb.atlassian.net/rest/api/3/issue/12345". The
+    // site's browsable base URL is everything before "/rest/api/...", which
+    // we need to build a real "View in Jira" link for each citation.
+    const siteBaseUrl = (issue.self || "").split("/rest/api/")[0];
+
     // Build a single numbered list of everything the AI is allowed to cite.
     // This is the one place that knows about "sources" as a concept — if we
     // add attachments, Confluence pages, etc. later, they just get appended
     // here and everything downstream (prompt, frontend) keeps working as-is.
-    const sources = buildSourceList({ description, comments });
+    const sources = buildSourceList({
+      issueKey,
+      siteBaseUrl,
+      description,
+      comments,
+    });
 
     // Once the AI has generated a result for this issue, it should STAY as
     // is until the user explicitly clicks Refresh — not regenerate on every
@@ -101,14 +113,23 @@ resolver.define("getIssueContext", async (req) => {
 // Builds the unified, numbered list of citable sources. Index in this array
 // (1-based) is exactly the citation marker number the AI will use, and what
 // the frontend looks up when the user clicks a [n] marker.
-function buildSourceList({ description, comments }) {
+//
+// Each source carries a jiraUrl: for a comment, a real deep link
+// (?focusedCommentId=<id>) that jumps to and highlights that exact comment
+// on the native Jira issue page when opened in a new tab (opening in the
+// same tab is a known Jira Cloud limitation — see JRACLOUD-77216 — so the
+// frontend always opens this in a new tab). The description has no
+// equivalent anchor, so it just links to the issue itself.
+function buildSourceList({ issueKey, siteBaseUrl, description, comments }) {
   const sources = [];
+  const issueUrl = `${siteBaseUrl}/browse/${issueKey}`;
 
   if (description) {
     sources.push({
       type: "description",
       label: "Issue description",
       text: description,
+      jiraUrl: issueUrl,
     });
   }
 
@@ -117,6 +138,7 @@ function buildSourceList({ description, comments }) {
       type: "comment",
       label: `Comment ${i + 1} — ${c.author}`,
       text: c.text,
+      jiraUrl: c.id ? `${issueUrl}?focusedCommentId=${c.id}` : issueUrl,
     });
   });
 
