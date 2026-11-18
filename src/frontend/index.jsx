@@ -125,7 +125,10 @@ const App = () => {
             <Text>
               {summaryParts.map((part, i) =>
                 part.type === "text" ? (
-                  <Text key={i}>{part.value}</Text>
+                  // Plain string, not wrapped in another Text — keeps it
+                  // flowing inline with the citation markers on either side
+                  // instead of each fragment becoming its own block/line.
+                  part.value
                 ) : (
                   <Pressable
                     key={i}
@@ -133,9 +136,7 @@ const App = () => {
                     padding="space.0"
                     backgroundColor="color.background.neutral.subtle"
                   >
-                    <Text>
-                      <Strong>[{part.marker}]</Strong>
-                    </Text>
+                    {`[${part.marker}]`}
                   </Pressable>
                 ),
               )}
