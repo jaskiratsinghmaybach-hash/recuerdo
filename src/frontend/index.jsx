@@ -175,10 +175,20 @@ const App = () => {
   const [activeMarkers, setActiveMarkers] = useState(null); // array of marker numbers, or null if closed
   const [isFilterOpen, setIsFilterOpen] = useState(false);
   const [savingSelection, setSavingSelection] = useState(false);
+  // Mirrors context.selection but updates INSTANTLY on click, before the
+  // save/regenerate round trip to the backend finishes — this is what the
+  // checkboxes render from, so toggling feels immediate instead of
+  // freezing for the few seconds a new AI call can take.
+  const [optimisticSelection, setOptimisticSelection] = useState(null);
 
   const loadContext = useCallback((key, forceRefresh) => {
     return invoke("getIssueContext", { issueKey: key, forceRefresh }).then(
-      setContext,
+      (result) => {
+        setContext(result);
+        if (result?.selection) {
+          setOptimisticSelection(result.selection);
+        }
+      },
     );
   }, []);
 
@@ -207,14 +217,29 @@ const App = () => {
   };
 
   const handleToggleSource = async (category, nextValue) => {
-    if (!issueKey || savingSelection || !context?.selection) return;
+    if (!issueKey || savingSelection || !optimisticSelection) return;
+    const nextSelection = { ...optimisticSelection, [category]: nextValue };
+    // Update immediately so the checkbox reflects the click right away —
+    // the save + AI regeneration below can take a few seconds, but the
+    // user shouldn't have to watch the checkbox freeze while that happens.
+    setOptimisticSelection(nextSelection);
     setSavingSelection(true);
-    const nextSelection = { ...context.selection, [category]: nextValue };
-    await invoke("setSourceSelection", { issueKey, selection: nextSelection });
-    // The resolver clears the cached AI result whenever the selection
-    // changes, so this reload regenerates the summary with the new sources
-    // without the user needing to separately hit Refresh too.
-    await loadContext(issueKey, false);
+    try {
+      await invoke("setSourceSelection", {
+        issueKey,
+        selection: nextSelection,
+      });
+      // The resolver clears the cached AI result whenever the selection
+      // changes, so this reload regenerates the summary with the new
+      // sources without the user needing to separately hit Refresh too.
+      await loadContext(issueKey, false);
+    } catch (err) {
+      // If the save failed, revert the optimistic checkbox state back to
+      // whatever the last confirmed context actually had.
+      if (context?.selection) {
+        setOptimisticSelection(context.selection);
+      }
+    }
     setSavingSelection(false);
   };
 
@@ -282,7 +307,7 @@ const App = () => {
                       <Checkbox
                         key={category}
                         label={label}
-                        isChecked={context.selection?.[category] ?? true}
+                        isChecked={optimisticSelection?.[category] ?? true}
                         isDisabled={savingSelection}
                         onChange={(e) =>
                           handleToggleSource(category, e.target.checked)
