@@ -10,6 +10,41 @@ function cacheKeyFor(issueKey) {
   return `ai-summary#${issueKey}`;
 }
 
+// Cache key for a given issue's source-selection preferences (which source
+// categories the user has chosen to include). Per-issue, not global — set
+// once via the filter panel, persists across reloads until changed.
+function selectionKeyFor(issueKey) {
+  return `source-selection#${issueKey}`;
+}
+
+// Every known source category and whether it's included by default. New
+// source types (e.g. Confluence pages) get added here when they're built.
+const DEFAULT_SELECTION = {
+  description: true,
+  comments: true,
+};
+
+resolver.define("setSourceSelection", async (req) => {
+  const { issueKey, selection } = req.payload;
+
+  if (!issueKey || !selection) {
+    return { error: "Missing issueKey or selection" };
+  }
+
+  // Merge onto the defaults rather than trusting the payload wholesale, so
+  // an older frontend that doesn't know about a newer source type can't
+  // accidentally wipe its (future) default.
+  const merged = { ...DEFAULT_SELECTION, ...selection };
+  await kvs.set(selectionKeyFor(issueKey), merged);
+
+  // Changing which sources feed the AI makes the previously cached result
+  // stale — clear it so the next load regenerates with the new selection,
+  // without the user needing to separately click Refresh too.
+  await kvs.delete(cacheKeyFor(issueKey));
+
+  return { selection: merged };
+});
+
 resolver.define("getIssueContext", async (req) => {
   const { issueKey, forceRefresh } = req.payload;
 
@@ -18,6 +53,8 @@ resolver.define("getIssueContext", async (req) => {
   }
 
   try {
+    const storedSelection = await kvs.get(selectionKeyFor(issueKey));
+    const selection = { ...DEFAULT_SELECTION, ...(storedSelection || {}) };
     // Fetch the issue itself (status, summary, description, resolution)
     const issueRes = await api
       .asUser()
@@ -53,7 +90,7 @@ resolver.define("getIssueContext", async (req) => {
     // view.getContext() call already returns a reliable siteUrl for the
     // real domain, so each source only carries the relative piece
     // (focusedCommentId, if any) and the frontend builds the full URL.
-    const sources = buildSourceList({ description, comments });
+    const sources = buildSourceList({ description, comments, selection });
 
     // Once the AI has generated a result for this issue, it should STAY as
     // is until the user explicitly clicks Refresh — not regenerate on every
@@ -93,6 +130,7 @@ resolver.define("getIssueContext", async (req) => {
       comments,
       description,
       sources,
+      selection,
       aiHeading: aiResult.heading || null,
       aiBody: aiResult.body || [],
       aiCitations: aiResult.citations || [],
@@ -108,31 +146,52 @@ resolver.define("getIssueContext", async (req) => {
 // (1-based) is exactly the citation marker number the AI will use, and what
 // the frontend looks up when the user clicks a [n] marker.
 //
+// selection controls which categories are included at all:
+// - A DESELECTED category (selection.description or selection.comments is
+//   false) is skipped entirely — the user said not to use it, so it's
+//   excluded from both the AI prompt and the citable sources list.
+// - A SELECTED category that happens to have no real content (e.g. the
+//   user wants the description included but the issue has none written)
+//   still gets an explicit placeholder entry, so the AI is told plainly
+//   that this source is empty rather than it silently going missing and
+//   the AI guessing or staying silent about why.
+//
 // Each comment source carries commentId (Jira's real comment id). The
 // frontend combines this with its own siteUrl (from view.getContext()) and
 // the issue key to build the full "View in Jira" deep link
 // (?focusedCommentId=<id>), opened in a new tab — same-tab navigation to a
 // focusedCommentId is a known Jira Cloud limitation (JRACLOUD-77216).
-function buildSourceList({ description, comments }) {
+function buildSourceList({ description, comments, selection }) {
   const sources = [];
 
-  if (description) {
+  if (selection.description) {
     sources.push({
       type: "description",
       label: "Issue description",
-      text: description,
+      text: description || "(No description was written on this issue.)",
       commentId: null,
     });
   }
 
-  comments.forEach((c, i) => {
-    sources.push({
-      type: "comment",
-      label: `Comment ${i + 1} — ${c.author}`,
-      text: c.text,
-      commentId: c.id || null,
-    });
-  });
+  if (selection.comments) {
+    if (comments.length === 0) {
+      sources.push({
+        type: "comment",
+        label: "Comments",
+        text: "(No comments have been posted on this issue.)",
+        commentId: null,
+      });
+    } else {
+      comments.forEach((c, i) => {
+        sources.push({
+          type: "comment",
+          label: `Comment ${i + 1} — ${c.author}`,
+          text: c.text,
+          commentId: c.id || null,
+        });
+      });
+    }
+  }
 
   return sources;
 }
@@ -144,8 +203,8 @@ function buildSourceList({ description, comments }) {
 // Contract with the Lambda proxy:
 //   Request:  POST, header "x-recuerdo-secret": <shared secret>,
 //             JSON body { prompt: string }
-//   Response: JSON body { heading, body, citations } on success,
-//             or { error: string } on failure.
+//   Response: JSON body { summary: string, citations: [{marker, reason}] }
+//             on success, or { error: string } on failure.
 async function getAiSummary({ issueKey, title, status, resolution, sources }) {
   const proxyUrl = process.env.LAMBDA_PROXY_URL;
   const proxySecret = process.env.LAMBDA_PROXY_SECRET;

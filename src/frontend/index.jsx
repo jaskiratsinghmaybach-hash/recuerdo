@@ -16,9 +16,19 @@ import ForgeReconciler, {
   ModalTitle,
   ModalFooter,
   ModalTransition,
+  Popup,
+  Checkbox,
   xcss,
 } from "@forge/react";
 import { invoke, view } from "@forge/bridge";
+
+// Display labels for each source category in the filter panel. Add an entry
+// here (and a matching default in the resolver's DEFAULT_SELECTION) when a
+// new source type, like Confluence pages, is introduced.
+const SOURCE_CATEGORY_LABELS = {
+  description: "Issue description",
+  comments: "Comments",
+};
 
 // Per-source-type styling for inline citation markers: icon glyph plus a
 // distinct accent color, so each citation reads as a small colored pill
@@ -162,6 +172,8 @@ const App = () => {
   const [siteUrl, setSiteUrl] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [activeMarkers, setActiveMarkers] = useState(null); // array of marker numbers, or null if closed
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
+  const [savingSelection, setSavingSelection] = useState(false);
 
   const loadContext = useCallback((key, forceRefresh) => {
     return invoke("getIssueContext", { issueKey: key, forceRefresh }).then(
@@ -191,6 +203,18 @@ const App = () => {
     setRefreshing(true);
     await loadContext(issueKey, true);
     setRefreshing(false);
+  };
+
+  const handleToggleSource = async (category, nextValue) => {
+    if (!issueKey || savingSelection || !context?.selection) return;
+    setSavingSelection(true);
+    const nextSelection = { ...context.selection, [category]: nextValue };
+    await invoke("setSourceSelection", { issueKey, selection: nextSelection });
+    // The resolver clears the cached AI result whenever the selection
+    // changes, so this reload regenerates the summary with the new sources
+    // without the user needing to separately hit Refresh too.
+    await loadContext(issueKey, false);
+    setSavingSelection(false);
   };
 
   if (!context) {
@@ -227,13 +251,51 @@ const App = () => {
     <Stack space="space.200">
       <Inline space="space.100" alignBlock="center" spread="space-between">
         <Heading size="small">recuerdo</Heading>
-        <Button
-          appearance="subtle"
-          onClick={handleRefresh}
-          isDisabled={refreshing}
-        >
-          {refreshing ? "Refreshing..." : "Refresh"}
-        </Button>
+        <Inline space="space.075" alignBlock="center">
+          <Popup
+            isOpen={isFilterOpen}
+            onClose={() => setIsFilterOpen(false)}
+            placement="bottom-end"
+            trigger={() => (
+              <Pressable
+                onClick={() => setIsFilterOpen((open) => !open)}
+                padding="space.050"
+                backgroundColor="color.background.neutral.subtle"
+              >
+                <Icon
+                  glyph="filter"
+                  label="Choose which sources to include"
+                  size="small"
+                />
+              </Pressable>
+            )}
+            content={() => (
+              <Stack space="space.100">
+                <Text weight="bold">Sources to include</Text>
+                {Object.entries(SOURCE_CATEGORY_LABELS).map(
+                  ([category, label]) => (
+                    <Checkbox
+                      key={category}
+                      label={label}
+                      isChecked={context.selection?.[category] ?? true}
+                      isDisabled={savingSelection}
+                      onChange={(e) =>
+                        handleToggleSource(category, e.target.checked)
+                      }
+                    />
+                  ),
+                )}
+              </Stack>
+            )}
+          />
+          <Button
+            appearance="subtle"
+            onClick={handleRefresh}
+            isDisabled={refreshing}
+          >
+            {refreshing ? "Refreshing..." : "Refresh"}
+          </Button>
+        </Inline>
       </Inline>
 
       <Stack space="space.100">
