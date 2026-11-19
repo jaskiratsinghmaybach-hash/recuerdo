@@ -81,7 +81,7 @@ resolver.define("getIssueContext", async (req) => {
       // Only cache a usable result — don't cache transient errors, so the
       // next load (or Refresh) gets a real chance to succeed instead of
       // being stuck replaying a stored failure.
-      if (aiResult.summary) {
+      if (aiResult.heading) {
         await kvs.set(cacheKey, aiResult);
       }
     }
@@ -93,7 +93,8 @@ resolver.define("getIssueContext", async (req) => {
       comments,
       description,
       sources,
-      aiSummary: aiResult.summary || null,
+      aiHeading: aiResult.heading || null,
+      aiBody: aiResult.body || [],
       aiCitations: aiResult.citations || [],
       aiError: aiResult.error || null,
     };
@@ -143,8 +144,8 @@ function buildSourceList({ description, comments }) {
 // Contract with the Lambda proxy:
 //   Request:  POST, header "x-recuerdo-secret": <shared secret>,
 //             JSON body { prompt: string }
-//   Response: JSON body { summary: string, citations: [{marker, reason}] }
-//             on success, or { error: string } on failure.
+//   Response: JSON body { heading, body, citations } on success,
+//             or { error: string } on failure.
 async function getAiSummary({ issueKey, title, status, resolution, sources }) {
   const proxyUrl = process.env.LAMBDA_PROXY_URL;
   const proxySecret = process.env.LAMBDA_PROXY_SECRET;
@@ -184,7 +185,11 @@ async function getAiSummary({ issueKey, title, status, resolution, sources }) {
       return { error: data.error };
     }
 
-    return { summary: data.summary || null, citations: data.citations || [] };
+    return {
+      heading: data.heading || null,
+      body: data.body || [],
+      citations: data.citations || [],
+    };
   } catch (err) {
     console.error("Error calling Lambda proxy:", err);
     return { error: "Could not reach AI backend" };
@@ -192,10 +197,12 @@ async function getAiSummary({ issueKey, title, status, resolution, sources }) {
 }
 
 // Builds the prompt sent to the AI model. Asks for STRUCTURED JSON output:
-// a summary with [n] citation markers inline, plus a citations array
-// explaining why each marker was cited. The source list is numbered exactly
-// as buildSourceList() numbered it, so markers map directly to sources[] on
-// the frontend with no fuzzy matching required.
+// a short heading, one or more body blocks (plain paragraphs, or a bulleted
+// list when that's genuinely clearer — the AI's own judgment call, not
+// forced every time), with [n] citation markers inline in the text, plus a
+// citations array explaining why each marker was cited. The source list is
+// numbered exactly as buildSourceList() numbered it, so markers map
+// directly to sources[] on the frontend with no fuzzy matching required.
 function buildPrompt({ issueKey, title, status, resolution, sources }) {
   const sourceBlock = sources
     .map((s, i) => `[${i + 1}] ${s.label}:\n${s.text}`)
@@ -212,18 +219,25 @@ function buildPrompt({ issueKey, title, status, resolution, sources }) {
     ``,
     `Respond with ONLY a JSON object (no markdown, no code fences) in this exact shape:`,
     `{`,
-    `  "summary": "A VERY SHORT 1-2 sentence summary (max 40 words total) of the actual decision made and why, with inline citation markers like [1] or [2] placed right after each claim they support.",`,
+    `  "heading": "A short, bold-worthy title for the decision, a few words (e.g. 'TTL/refresh mismatch').",`,
+    `  "body": [`,
+    `    { "type": "paragraph", "text": "Prose text with inline citation markers like [1] or [2] placed right after each claim they support." },`,
+    `    { "type": "bullets", "items": ["Point one [3]", "Point two [4]"] }`,
+    `  ],`,
     `  "citations": [`,
     `    { "marker": 1, "reason": "A SHORT phrase, under 12 words, on why source [1] supports that claim — not a full sentence." }`,
     `  ]`,
     `}`,
     ``,
     `Rules:`,
-    `- Keep "summary" to at most 40 words total. Brevity matters more than completeness.`,
+    `- Use a SINGLE "paragraph" block for simple, short explanations (most cases).`,
+    `- Use a "bullets" block ONLY when the issue involved several distinct comments, sources, or a genuinely multi-step chain of events that is clearer as separate points. Don't force bullets when one or two sentences would do.`,
+    `- You may mix one paragraph block followed by one bullets block (e.g. a one-line lead-in, then supporting points) if that reads best — but never more than 2 blocks total.`,
+    `- Keep the total word count across all blocks under about 60 words. Brevity matters more than completeness.`,
     `- Keep each citation "reason" to at most 12 words.`,
     `- Only cite source numbers that actually exist in the list above.`,
-    `- Every citation marker used in "summary" must have a matching entry in "citations".`,
-    `- If the sources don't contain a clear decision or reason, say so plainly in "summary" instead of guessing, and return an empty "citations" array.`,
+    `- Every citation marker used anywhere in "body" must have a matching entry in "citations".`,
+    `- If the sources don't contain a clear decision or reason, say so plainly in one paragraph block instead of guessing, and return an empty "citations" array.`,
   ].join("\n");
 }
 

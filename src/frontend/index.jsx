@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import ForgeReconciler, {
   Text,
   Stack,
@@ -10,7 +10,6 @@ import ForgeReconciler, {
   LinkButton,
   Pressable,
   Icon,
-  Tooltip,
   Modal,
   ModalBody,
   ModalHeader,
@@ -48,31 +47,113 @@ function styleForSourceType(type) {
   return SOURCE_TYPE_STYLES[type] || DEFAULT_SOURCE_STYLE;
 }
 
-// Splits a summary string like "Tokens expired early [3] due to a TTL change [1]."
-// into plain text segments and citation marker numbers, in order, so we can
-// render the markers as clickable elements inline with the rest of the text.
-function splitSummaryIntoParts(summary) {
-  const parts = [];
+// Splits a string like "Tokens expired early [3] due to a TTL change [1]."
+// into plain text segments and GROUPS of citation marker numbers. Adjacent
+// markers with nothing but whitespace between them (e.g. "[3][4]" or
+// "[3] [4]") are grouped into a single badge instead of rendering one badge
+// per marker — this is the fix for icon clutter when several sources
+// support the same claim right next to each other.
+function splitIntoPartsWithGroupedCitations(text) {
+  // First pass: tokenize into plain-text runs and individual marker numbers.
+  const tokens = [];
   const regex = /\[(\d+)\]/g;
   let lastIndex = 0;
   let match;
 
-  while ((match = regex.exec(summary)) !== null) {
+  while ((match = regex.exec(text)) !== null) {
     if (match.index > lastIndex) {
-      parts.push({
-        type: "text",
-        value: summary.slice(lastIndex, match.index),
-      });
+      tokens.push({ type: "text", value: text.slice(lastIndex, match.index) });
     }
-    parts.push({ type: "citation", marker: parseInt(match[1], 10) });
+    tokens.push({ type: "marker", value: parseInt(match[1], 10) });
     lastIndex = regex.lastIndex;
   }
+  if (lastIndex < text.length) {
+    tokens.push({ type: "text", value: text.slice(lastIndex) });
+  }
 
-  if (lastIndex < summary.length) {
-    parts.push({ type: "text", value: summary.slice(lastIndex) });
+  // Second pass: merge a marker with any immediately-following markers that
+  // are separated only by whitespace (no other text) into one citation group.
+  const parts = [];
+  let i = 0;
+  while (i < tokens.length) {
+    const token = tokens[i];
+    if (token.type === "text") {
+      parts.push(token);
+      i++;
+      continue;
+    }
+    // token.type === 'marker' — start a new group and absorb any markers
+    // that follow, skipping over whitespace-only text tokens in between.
+    const group = [token.value];
+    let j = i + 1;
+    while (j < tokens.length) {
+      if (tokens[j].type === "marker") {
+        group.push(tokens[j].value);
+        j++;
+      } else if (tokens[j].type === "text" && tokens[j].value.trim() === "") {
+        j++; // whitespace between adjacent markers — keep looking
+      } else {
+        break; // real text content — group ends here
+      }
+    }
+    parts.push({ type: "citation-group", markers: group });
+    i = j;
   }
 
   return parts;
+}
+
+// Renders one block of AI output (a paragraph or a bulleted list), resolving
+// citation marker groups into clickable pill badges via onCitationClick.
+function BodyBlock({ block, sources, onCitationClick }) {
+  const renderTextWithCitations = (text, keyPrefix) => {
+    const parts = splitIntoPartsWithGroupedCitations(text);
+    return parts.map((part, i) => {
+      if (part.type === "text") {
+        return part.value; // plain string — stays inline, no wrapping element
+      }
+      // citation-group: style the badge after its FIRST source (arbitrary
+      // but consistent choice when a group spans more than one type).
+      const firstSource = sources[part.markers[0] - 1];
+      const style = styleForSourceType(firstSource?.type);
+      return (
+        <Pressable
+          key={`${keyPrefix}-${i}`}
+          onClick={() => onCitationClick(part.markers)}
+          padding="space.025"
+          backgroundColor={style.background}
+          xcss={xcss({
+            borderRadius: "radius.full",
+            borderStyle: "solid",
+            borderWidth: "border.width",
+            borderColor: style.border,
+          })}
+        >
+          <Icon
+            glyph={style.glyph}
+            label={`View ${part.markers.length > 1 ? "citation sources" : "citation source"}`}
+            size="small"
+          />
+        </Pressable>
+      );
+    });
+  };
+
+  if (block.type === "bullets") {
+    return (
+      <Stack space="space.050">
+        {block.items.map((item, idx) => (
+          <Inline key={idx} space="space.075" alignBlock="start">
+            <Text>•</Text>
+            <Text>{renderTextWithCitations(item, `b${idx}`)}</Text>
+          </Inline>
+        ))}
+      </Stack>
+    );
+  }
+
+  // "paragraph"
+  return <Text>{renderTextWithCitations(block.text, "p")}</Text>;
 }
 
 const App = () => {
@@ -80,7 +161,7 @@ const App = () => {
   const [issueKey, setIssueKey] = useState(null);
   const [siteUrl, setSiteUrl] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [activeCitation, setActiveCitation] = useState(null); // marker number, or null if closed
+  const [activeMarkers, setActiveMarkers] = useState(null); // array of marker numbers, or null if closed
 
   const loadContext = useCallback((key, forceRefresh) => {
     return invoke("getIssueContext", { issueKey: key, forceRefresh }).then(
@@ -112,11 +193,6 @@ const App = () => {
     setRefreshing(false);
   };
 
-  const summaryParts = useMemo(() => {
-    if (!context?.aiSummary) return [];
-    return splitSummaryIntoParts(context.aiSummary);
-  }, [context?.aiSummary]);
-
   if (!context) {
     return <Text>Loading...</Text>;
   }
@@ -128,19 +204,22 @@ const App = () => {
   const hasComments = context.comments && context.comments.length > 0;
   const sources = context.sources || [];
   const citations = context.aiCitations || [];
+  const aiBody = context.aiBody || [];
 
-  // Look up everything the modal needs for the currently open citation.
-  const activeSource = activeCitation ? sources[activeCitation - 1] : null;
-  const activeReason = activeCitation
-    ? citations.find((c) => c.marker === activeCitation)?.reason
-    : null;
+  // The modal can show one or several sources at once (a merged citation
+  // group). Build the list of {source, reason} pairs it needs.
+  const activeEntries = (activeMarkers || [])
+    .map((marker) => ({
+      marker,
+      source: sources[marker - 1],
+      reason: citations.find((c) => c.marker === marker)?.reason,
+    }))
+    .filter((entry) => entry.source);
 
-  // Built here, not in the resolver, because siteUrl (Forge's own reliable
-  // site domain) is only available on the frontend via view.getContext().
-  const activeJiraUrl =
-    activeSource && siteUrl && issueKey
-      ? activeSource.commentId
-        ? `${siteUrl}/browse/${issueKey}?focusedCommentId=${activeSource.commentId}`
+  const buildJiraUrl = (source) =>
+    source && siteUrl && issueKey
+      ? source.commentId
+        ? `${siteUrl}/browse/${issueKey}?focusedCommentId=${source.commentId}`
         : `${siteUrl}/browse/${issueKey}`
       : null;
 
@@ -171,48 +250,25 @@ const App = () => {
             No description or comments on this issue yet — nothing to summarize.
           </Text>
         )}
-        {(hasComments || context.description) && context.aiSummary && (
+        {(hasComments || context.description) && context.aiHeading && (
           <SectionMessage appearance="information">
-            <Text>
-              {summaryParts.map((part, i) => {
-                if (part.type === "text") {
-                  // Plain string, not wrapped in another Text — keeps it
-                  // flowing inline with the citation markers on either side
-                  // instead of each fragment becoming its own block/line.
-                  return part.value;
-                }
-                const matchedSource = sources[part.marker - 1];
-                const style = styleForSourceType(matchedSource?.type);
-                return (
-                  <Tooltip
+            <Stack space="space.100">
+              <Text weight="bold">{context.aiHeading}</Text>
+              <Stack space="space.100">
+                {aiBody.map((block, i) => (
+                  <BodyBlock
                     key={i}
-                    content={matchedSource?.label || "View source"}
-                  >
-                    <Pressable
-                      onClick={() => setActiveCitation(part.marker)}
-                      padding="space.025"
-                      backgroundColor={style.background}
-                      xcss={xcss({
-                        borderRadius: "radius.full",
-                        borderStyle: "solid",
-                        borderWidth: "border.width",
-                        borderColor: style.border,
-                      })}
-                    >
-                      <Icon
-                        glyph={style.glyph}
-                        label={`View citation source: ${matchedSource?.label || "source"}`}
-                        size="small"
-                      />
-                    </Pressable>
-                  </Tooltip>
-                );
-              })}
-            </Text>
+                    block={block}
+                    sources={sources}
+                    onCitationClick={setActiveMarkers}
+                  />
+                ))}
+              </Stack>
+            </Stack>
           </SectionMessage>
         )}
         {(hasComments || context.description) &&
-          !context.aiSummary &&
+          !context.aiHeading &&
           context.aiError && (
             <SectionMessage appearance="warning">
               <Text>
@@ -221,42 +277,58 @@ const App = () => {
             </SectionMessage>
           )}
         {(hasComments || context.description) &&
-          !context.aiSummary &&
+          !context.aiHeading &&
           !context.aiError && <Text>No summary available.</Text>}
       </Stack>
 
       <ModalTransition>
-        {activeCitation && activeSource && (
-          <Modal onClose={() => setActiveCitation(null)}>
+        {activeEntries.length > 0 && (
+          <Modal onClose={() => setActiveMarkers(null)}>
             <ModalHeader>
-              <ModalTitle>{activeSource.label}</ModalTitle>
+              <ModalTitle>
+                {activeEntries.length === 1
+                  ? activeEntries[0].source.label
+                  : `${activeEntries.length} sources`}
+              </ModalTitle>
             </ModalHeader>
             <ModalBody>
-              <Stack space="space.150">
-                <Text>{activeSource.text}</Text>
-                {activeReason && (
-                  <SectionMessage
-                    appearance="discovery"
-                    title="Why recuerdo cited this"
-                  >
-                    <Text>{activeReason}</Text>
-                  </SectionMessage>
-                )}
+              <Stack space="space.200">
+                {activeEntries.map((entry, i) => {
+                  const jiraUrl = buildJiraUrl(entry.source);
+                  return (
+                    <Stack key={i} space="space.100">
+                      {activeEntries.length > 1 && (
+                        <Text weight="bold">{entry.source.label}</Text>
+                      )}
+                      <Text>{entry.source.text}</Text>
+                      {entry.reason && (
+                        <SectionMessage
+                          appearance="discovery"
+                          title="Why recuerdo cited this"
+                        >
+                          <Text>{entry.reason}</Text>
+                        </SectionMessage>
+                      )}
+                      {jiraUrl && (
+                        <Inline>
+                          <LinkButton
+                            href={jiraUrl}
+                            target="_blank"
+                            appearance="default"
+                          >
+                            View in Jira
+                          </LinkButton>
+                        </Inline>
+                      )}
+                    </Stack>
+                  );
+                })}
               </Stack>
             </ModalBody>
             <ModalFooter>
-              {activeJiraUrl && (
-                <LinkButton
-                  href={activeJiraUrl}
-                  target="_blank"
-                  appearance="default"
-                >
-                  View in Jira
-                </LinkButton>
-              )}
               <Button
                 appearance="subtle"
-                onClick={() => setActiveCitation(null)}
+                onClick={() => setActiveMarkers(null)}
               >
                 Close
               </Button>
