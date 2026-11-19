@@ -18,6 +18,7 @@ import ForgeReconciler, {
   ModalTransition,
   Popup,
   Checkbox,
+  Box,
   xcss,
 } from "@forge/react";
 import { invoke, view } from "@forge/bridge";
@@ -257,35 +258,40 @@ const App = () => {
             onClose={() => setIsFilterOpen(false)}
             placement="bottom-end"
             trigger={() => (
-              <Pressable
+              <Button
+                appearance="subtle"
+                iconBefore="filter"
                 onClick={() => setIsFilterOpen((open) => !open)}
-                padding="space.050"
-                backgroundColor="color.background.neutral.subtle"
               >
-                <Icon
-                  glyph="filter"
-                  label="Choose which sources to include"
-                  size="small"
-                />
-              </Pressable>
+                Sources
+              </Button>
             )}
             content={() => (
-              <Stack space="space.100">
-                <Text weight="bold">Sources to include</Text>
-                {Object.entries(SOURCE_CATEGORY_LABELS).map(
-                  ([category, label]) => (
-                    <Checkbox
-                      key={category}
-                      label={label}
-                      isChecked={context.selection?.[category] ?? true}
-                      isDisabled={savingSelection}
-                      onChange={(e) =>
-                        handleToggleSource(category, e.target.checked)
-                      }
-                    />
-                  ),
-                )}
-              </Stack>
+              <Box
+                padding="space.150"
+                backgroundColor="elevation.surface.overlay"
+                xcss={xcss({
+                  borderRadius: "radius.medium",
+                  boxShadow: "elevation.shadow.overlay",
+                })}
+              >
+                <Stack space="space.100">
+                  <Text weight="bold">Sources to include</Text>
+                  {Object.entries(SOURCE_CATEGORY_LABELS).map(
+                    ([category, label]) => (
+                      <Checkbox
+                        key={category}
+                        label={label}
+                        isChecked={context.selection?.[category] ?? true}
+                        isDisabled={savingSelection}
+                        onChange={(e) =>
+                          handleToggleSource(category, e.target.checked)
+                        }
+                      />
+                    ),
+                  )}
+                </Stack>
+              </Box>
             )}
           />
           <Button
