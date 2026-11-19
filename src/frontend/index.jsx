@@ -10,21 +10,42 @@ import ForgeReconciler, {
   LinkButton,
   Pressable,
   Icon,
+  Tooltip,
   Modal,
   ModalBody,
   ModalHeader,
   ModalTitle,
   ModalFooter,
   ModalTransition,
+  xcss,
 } from "@forge/react";
 import { invoke, view } from "@forge/bridge";
 
-// Which icon glyph represents each source type in an inline citation marker.
-// Falls back to 'link' for any future source type we haven't special-cased.
-function iconGlyphForSourceType(type) {
-  if (type === "comment") return "comment";
-  if (type === "description") return "document";
-  return "link";
+// Per-source-type styling for inline citation markers: icon glyph plus a
+// distinct accent color, so each citation reads as a small colored pill
+// badge (not a bare bracketed number) and visually hints at its source type
+// before the user even clicks it. Falls back to a neutral/link style for
+// any future source type we haven't special-cased yet.
+const SOURCE_TYPE_STYLES = {
+  comment: {
+    glyph: "comment",
+    background: "color.background.accent.blue.subtler",
+    border: "color.border.accent.blue",
+  },
+  description: {
+    glyph: "document",
+    background: "color.background.accent.green.subtler",
+    border: "color.border.accent.green",
+  },
+};
+const DEFAULT_SOURCE_STYLE = {
+  glyph: "link",
+  background: "color.background.accent.gray.subtler",
+  border: "color.border.accent.gray",
+};
+
+function styleForSourceType(type) {
+  return SOURCE_TYPE_STYLES[type] || DEFAULT_SOURCE_STYLE;
 }
 
 // Splits a summary string like "Tokens expired early [3] due to a TTL change [1]."
@@ -161,20 +182,30 @@ const App = () => {
                   return part.value;
                 }
                 const matchedSource = sources[part.marker - 1];
-                const glyph = iconGlyphForSourceType(matchedSource?.type);
+                const style = styleForSourceType(matchedSource?.type);
                 return (
-                  <Pressable
+                  <Tooltip
                     key={i}
-                    onClick={() => setActiveCitation(part.marker)}
-                    padding="space.0"
-                    backgroundColor="color.background.neutral.subtle"
+                    content={matchedSource?.label || "View source"}
                   >
-                    <Icon
-                      glyph={glyph}
-                      label={`View citation source: ${matchedSource?.label || "source"}`}
-                      size="small"
-                    />
-                  </Pressable>
+                    <Pressable
+                      onClick={() => setActiveCitation(part.marker)}
+                      padding="space.025"
+                      backgroundColor={style.background}
+                      xcss={xcss({
+                        borderRadius: "radius.full",
+                        borderStyle: "solid",
+                        borderWidth: "border.width",
+                        borderColor: style.border,
+                      })}
+                    >
+                      <Icon
+                        glyph={style.glyph}
+                        label={`View citation source: ${matchedSource?.label || "source"}`}
+                        size="small"
+                      />
+                    </Pressable>
+                  </Tooltip>
                 );
               })}
             </Text>
