@@ -24,6 +24,49 @@ const DEFAULT_SELECTION = {
   comments: true,
 };
 
+// A lightweight, dependency-free fingerprint of everything that could
+// change the AI's answer: the description text, status, resolution, and
+// every comment's id + text + timestamp (covers new comments, edited
+// comments, and deleted comments — not just "comment count"). Deliberately
+// NOT using Node's crypto module: Forge's runtime has a long history of
+// incomplete/unreliable crypto support (even the "native" Node runtime is
+// a relatively recent fix), and this only needs to detect SOME difference
+// reliably, not be cryptographically secure — a plain string comparison of
+// all the inputs, reduced to a short non-crypto hash, is equally effective
+// here with zero platform risk.
+function computeContentFingerprint({
+  description,
+  status,
+  resolution,
+  comments,
+}) {
+  const parts = [
+    description || "",
+    status || "",
+    resolution || "",
+    ...comments.map((c) => `${c.id}|${c.created}|${c.text}`),
+  ];
+  const combined = parts.join("\u0001"); // unlikely separator, avoids accidental collisions between fields
+
+  // Simple 32-bit rolling hash (not cryptographic — just needs to change
+  // whenever the input does, which this does reliably for our purpose).
+  let hash = 0;
+  for (let i = 0; i < combined.length; i++) {
+    hash = (hash * 31 + combined.charCodeAt(i)) | 0; // |0 keeps it a 32-bit int, mirrors typical string-hash patterns
+  }
+  return hash.toString(36);
+}
+
+// Shallow comparison of two selection objects — true only if every known
+// category matches. Used to decide whether a cached AI result was
+// generated with the exact same source selection the user has right now.
+function selectionsMatch(a, b) {
+  if (!a || !b) return false;
+  return Object.keys(DEFAULT_SELECTION).every(
+    (key) => Boolean(a[key]) === Boolean(b[key]),
+  );
+}
+
 resolver.define("setSourceSelection", async (req) => {
   const { issueKey, selection } = req.payload;
 
@@ -37,11 +80,11 @@ resolver.define("setSourceSelection", async (req) => {
   const merged = { ...DEFAULT_SELECTION, ...selection };
   await kvs.set(selectionKeyFor(issueKey), merged);
 
-  // Changing which sources feed the AI makes the previously cached result
-  // stale — clear it so the next load regenerates with the new selection,
-  // without the user needing to separately click Refresh too.
-  await kvs.delete(cacheKeyFor(issueKey));
-
+  // Deliberately does NOT touch the cached AI result or trigger any
+  // regeneration. Changing which sources are selected is now a pure
+  // preference save — the summary currently shown keeps showing exactly as
+  // is until the user explicitly clicks the refresh/apply button, which is
+  // the only thing that ever triggers a new AI call.
   return { selection: merged };
 });
 
@@ -82,6 +125,71 @@ resolver.define("getIssueContext", async (req) => {
     const resolution = issue.fields?.resolution?.name || null;
     const description = extractTextFromADF(issue.fields?.description);
 
+    // The AI result stays exactly as-is until the user explicitly clicks
+    // the refresh/apply button — a plain panel load/remount NEVER triggers
+    // a new AI call, regardless of the fingerprint. The fingerprint only
+    // matters when forceRefresh is true: it decides whether that click
+    // needs an actual new AI call, or can be answered instantly from cache
+    // because nothing relevant has actually changed.
+    const cacheKey = cacheKeyFor(issueKey);
+    const currentFingerprint = computeContentFingerprint({
+      description,
+      status,
+      resolution,
+      comments,
+    });
+    const cached = await kvs.get(cacheKey);
+    let aiResult;
+    // The selection that actually produced aiResult — starts as a guess
+    // but is corrected below once we know whether we're serving cached or
+    // freshly-generated content. sources[] MUST be built from THIS, not
+    // the user's live/unapplied selection, or a cached summary's citation
+    // markers (numbered against an older source list) would point at the
+    // wrong sources once the live selection has since been changed.
+    let appliedSelection = selection;
+
+    if (cached && !forceRefresh) {
+      // Plain load: always show whatever's cached, never regenerate.
+      aiResult = cached;
+      appliedSelection = cached.selection || selection;
+    } else if (
+      cached &&
+      forceRefresh &&
+      cached.fingerprint === currentFingerprint &&
+      selectionsMatch(cached.selection, selection)
+    ) {
+      // Refresh/apply was clicked, but neither the underlying Jira content
+      // nor the selected sources have changed since we last generated —
+      // skip the AI call entirely and return the cached result instantly.
+      aiResult = cached;
+      appliedSelection = cached.selection || selection;
+    } else {
+      // Either there's nothing cached yet, or something that matters
+      // actually changed (content, or which sources are selected) — this
+      // is the only branch that spends an AI call, using the user's
+      // current (live) selection, since that's what's being applied now.
+      const sourcesForGeneration = buildSourceList({
+        description,
+        comments,
+        selection,
+      });
+      aiResult = await getAiSummary({
+        issueKey,
+        title,
+        status,
+        resolution,
+        sources: sourcesForGeneration,
+      });
+      // Only cache a usable result — don't cache transient errors, so the
+      // next attempt gets a real chance to succeed instead of being stuck
+      // replaying a stored failure.
+      if (aiResult.heading) {
+        aiResult = { ...aiResult, fingerprint: currentFingerprint, selection };
+        await kvs.set(cacheKey, aiResult);
+      }
+      appliedSelection = selection;
+    }
+
     // NOTE: we deliberately do NOT build a full browsable URL here. Jira's
     // own "self" field on the issue/comment objects can be an internal
     // api.atlassian.com proxy URL rather than the real public site domain
@@ -90,38 +198,14 @@ resolver.define("getIssueContext", async (req) => {
     // view.getContext() call already returns a reliable siteUrl for the
     // real domain, so each source only carries the relative piece
     // (focusedCommentId, if any) and the frontend builds the full URL.
-    const sources = buildSourceList({ description, comments, selection });
-
-    // Once the AI has generated a result for this issue, it should STAY as
-    // is until the user explicitly clicks Refresh — not regenerate on every
-    // panel load/remount. So: check the cache first, and only call the AI
-    // when there's no cached result yet, or the user explicitly asked for
-    // a refresh.
-    const cacheKey = cacheKeyFor(issueKey);
-    let aiResult;
-
-    if (!forceRefresh) {
-      const cached = await kvs.get(cacheKey);
-      if (cached) {
-        aiResult = cached;
-      }
-    }
-
-    if (!aiResult) {
-      aiResult = await getAiSummary({
-        issueKey,
-        title,
-        status,
-        resolution,
-        sources,
-      });
-      // Only cache a usable result — don't cache transient errors, so the
-      // next load (or Refresh) gets a real chance to succeed instead of
-      // being stuck replaying a stored failure.
-      if (aiResult.heading) {
-        await kvs.set(cacheKey, aiResult);
-      }
-    }
+    //
+    // Built from appliedSelection (what actually produced aiResult), not
+    // the live `selection` — see note above.
+    const sources = buildSourceList({
+      description,
+      comments,
+      selection: appliedSelection,
+    });
 
     return {
       summary: title,
@@ -130,7 +214,8 @@ resolver.define("getIssueContext", async (req) => {
       comments,
       description,
       sources,
-      selection,
+      selection, // the user's current (possibly unapplied) preference
+      appliedSelection, // what the AI result currently shown was actually generated with
       aiHeading: aiResult.heading || null,
       aiBody: aiResult.body || [],
       aiCitations: aiResult.citations || [],

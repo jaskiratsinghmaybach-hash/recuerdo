@@ -174,19 +174,17 @@ const App = () => {
   const [refreshing, setRefreshing] = useState(false);
   const [activeMarkers, setActiveMarkers] = useState(null); // array of marker numbers, or null if closed
   const [isFilterOpen, setIsFilterOpen] = useState(false);
-  const [savingSelection, setSavingSelection] = useState(false);
-  // Mirrors context.selection but updates INSTANTLY on click, before the
-  // save/regenerate round trip to the backend finishes — this is what the
-  // checkboxes render from, so toggling feels immediate instead of
-  // freezing for the few seconds a new AI call can take.
-  const [optimisticSelection, setOptimisticSelection] = useState(null);
+  // The user's live checkbox state. Toggling this is PURE local state —
+  // no backend call happens here at all. It only gets saved/applied when
+  // the refresh/apply button below is explicitly clicked.
+  const [liveSelection, setLiveSelection] = useState(null);
 
   const loadContext = useCallback((key, forceRefresh) => {
     return invoke("getIssueContext", { issueKey: key, forceRefresh }).then(
       (result) => {
         setContext(result);
         if (result?.selection) {
-          setOptimisticSelection(result.selection);
+          setLiveSelection(result.selection);
         }
       },
     );
@@ -203,44 +201,41 @@ const App = () => {
       setSiteUrl(ctx.siteUrl);
       // Initial load: never forces a refresh. If a cached AI result exists
       // from a previous session, the resolver returns it instantly with no
-      // new AI call — the summary only regenerates when the user explicitly
-      // clicks Refresh below.
+      // new AI call.
       loadContext(key, false);
     });
   }, [loadContext]);
 
-  const handleRefresh = async () => {
+  // True when the user has toggled a checkbox since the currently-shown
+  // summary was generated — i.e. there's a pending change not yet applied.
+  const hasPendingSelectionChange =
+    context?.appliedSelection &&
+    liveSelection &&
+    Object.keys(liveSelection).some(
+      (key) =>
+        Boolean(liveSelection[key]) !== Boolean(context.appliedSelection[key]),
+    );
+
+  const handleRefreshOrApply = async () => {
     if (!issueKey || refreshing) return;
     setRefreshing(true);
+    // Save whatever the live checkbox state currently is (a no-op save if
+    // nothing changed since the last save) before asking for the result —
+    // the resolver's own fingerprint+selection check decides whether this
+    // actually needs a new AI call or can be answered from cache instantly.
+    if (liveSelection) {
+      await invoke("setSourceSelection", {
+        issueKey,
+        selection: liveSelection,
+      });
+    }
     await loadContext(issueKey, true);
     setRefreshing(false);
   };
 
-  const handleToggleSource = async (category, nextValue) => {
-    if (!issueKey || savingSelection || !optimisticSelection) return;
-    const nextSelection = { ...optimisticSelection, [category]: nextValue };
-    // Update immediately so the checkbox reflects the click right away —
-    // the save + AI regeneration below can take a few seconds, but the
-    // user shouldn't have to watch the checkbox freeze while that happens.
-    setOptimisticSelection(nextSelection);
-    setSavingSelection(true);
-    try {
-      await invoke("setSourceSelection", {
-        issueKey,
-        selection: nextSelection,
-      });
-      // The resolver clears the cached AI result whenever the selection
-      // changes, so this reload regenerates the summary with the new
-      // sources without the user needing to separately hit Refresh too.
-      await loadContext(issueKey, false);
-    } catch (err) {
-      // If the save failed, revert the optimistic checkbox state back to
-      // whatever the last confirmed context actually had.
-      if (context?.selection) {
-        setOptimisticSelection(context.selection);
-      }
-    }
-    setSavingSelection(false);
+  const handleToggleSource = (category, nextValue) => {
+    if (!liveSelection) return;
+    setLiveSelection({ ...liveSelection, [category]: nextValue });
   };
 
   if (!context) {
@@ -307,8 +302,7 @@ const App = () => {
                       <Checkbox
                         key={category}
                         label={label}
-                        isChecked={optimisticSelection?.[category] ?? true}
-                        isDisabled={savingSelection}
+                        isChecked={liveSelection?.[category] ?? true}
                         onChange={(e) =>
                           handleToggleSource(category, e.target.checked)
                         }
@@ -321,10 +315,16 @@ const App = () => {
           />
           <Button
             appearance="subtle"
-            onClick={handleRefresh}
+            onClick={handleRefreshOrApply}
             isDisabled={refreshing}
           >
-            {refreshing ? "Refreshing..." : "Refresh"}
+            {refreshing
+              ? hasPendingSelectionChange
+                ? "Regenerating..."
+                : "Refreshing..."
+              : hasPendingSelectionChange
+                ? "Apply & Regenerate"
+                : "Refresh"}
           </Button>
         </Inline>
       </Inline>
