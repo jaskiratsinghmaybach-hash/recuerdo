@@ -46,10 +46,28 @@ function truncateText(text, maxChars) {
 
 function extractConfluencePageId(url) {
   if (!url || typeof url !== "string") return null;
+  // Pattern 1: /wiki/spaces/KEY/pages/1234567/Page+Title
   const m1 = url.match(/\/wiki\/spaces\/[^\/]+\/pages\/(\d+)/i);
   if (m1) return m1[1];
+  // Pattern 2: /wiki/pages/viewpage.action?pageId=1234567
   const m2 = url.match(/[?&]pageId=(\d+)/i);
   if (m2) return m2[1];
+  // Pattern 3: Confluence Tiny URL (/wiki/x/<shortKey>) - base64 little-endian encoded 32-bit ID
+  const m3 = url.match(/\/wiki\/x\/([A-Za-z0-9_-]+)/i);
+  if (m3) {
+    try {
+      const b64 = m3[1].replace(/-/g, "+").replace(/_/g, "/");
+      const padded = b64 + "===".slice((b64.length + 3) % 4);
+      const buf = Buffer.from(padded, "base64");
+      let id = 0;
+      for (let i = 0; i < buf.length; i++) {
+        id += buf[i] * Math.pow(256, i);
+      }
+      if (id > 0) return String(id);
+    } catch (e) {
+      // ignore
+    }
+  }
   return null;
 }
 
@@ -71,6 +89,19 @@ function buildSourceList({
       commentId: null,
       attachmentId: null,
       confluenceUrl: null,
+    });
+  }
+
+  if (selection.confluence && confluencePages.length > 0) {
+    confluencePages.forEach((cp, i) => {
+      sources.push({
+        type: "confluence",
+        label: `Confluence Doc ${i + 1} — ${cp.title}`,
+        text: `Document "${cp.title}":\n${cp.text}`,
+        commentId: null,
+        attachmentId: null,
+        confluenceUrl: cp.url,
+      });
     });
   }
 
@@ -186,19 +217,6 @@ function buildSourceList({
         });
       });
     }
-  }
-
-  if (selection.confluence && confluencePages.length > 0) {
-    confluencePages.forEach((cp, i) => {
-      sources.push({
-        type: "confluence",
-        label: `Confluence Doc ${i + 1} — ${cp.title}`,
-        text: `Document "${cp.title}":\n${cp.text}`,
-        commentId: null,
-        attachmentId: null,
-        confluenceUrl: cp.url,
-      });
-    });
   }
 
   return sources;
@@ -490,6 +508,11 @@ async function runAllTests() {
   test("extracts Confluence Page ID from viewpage.action URL", () => {
     const url = "https://my-team.atlassian.net/wiki/pages/viewpage.action?pageId=11223344";
     assert.equal(extractConfluencePageId(url), "11223344");
+  });
+
+  test("extracts Confluence Page ID from tiny/short URL (/wiki/x/...)", () => {
+    const url = "https://one-atlas-xltb.atlassian.net/wiki/x/AoBX";
+    assert.equal(extractConfluencePageId(url), "5734402");
   });
 
   test("returns null for non-confluence or invalid URLs", () => {

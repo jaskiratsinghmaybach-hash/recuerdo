@@ -30,6 +30,96 @@ const DEFAULT_SELECTION = {
 // stack traces pasted into comments are truncated to preserve token budget.
 const MAX_COMMENT_CHARS = 1200;
 
+// Maximum characters we read from a text-based attachment file. Enough for
+// a full stack trace, config file, or short crash log — but we cap it so
+// a 10 MB log file doesn't blow the prompt token budget.
+const MAX_ATTACHMENT_CHARS = 2000;
+
+// MIME types and file extensions we consider "plain text" and therefore
+// safe to fetch and read as UTF-8 from the Jira attachment download URL.
+// Images, PDFs, and binary blobs are excluded — the AI can't read those.
+const TEXT_MIME_TYPES = new Set([
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "text/html",
+  "text/xml",
+  "text/x-log",
+  "application/json",
+  "application/xml",
+  "application/x-yaml",
+  "application/x-sh",
+  "application/javascript",
+  "application/typescript",
+]);
+
+// File extensions treated as readable text even if the MIME type is generic
+// (e.g. "application/octet-stream" for .log files uploaded from Windows).
+const TEXT_EXTENSIONS = new Set([
+  "txt", "log", "md", "markdown", "csv", "json", "yaml", "yml",
+  "xml", "html", "htm", "js", "ts", "jsx", "tsx", "py", "rs",
+  "go", "java", "kt", "rb", "php", "sh", "bash", "zsh", "fish",
+  "sql", "toml", "ini", "cfg", "conf", "env", "properties",
+]);
+
+// Returns true for file types our AI backend can actually read.
+// Images, PDFs, videos, and binary blobs return false — the AI is text-only.
+function isTextReadable(mimeType, filename) {
+  if (mimeType && TEXT_MIME_TYPES.has(mimeType.toLowerCase().split(";")[0].trim())) {
+    return true;
+  }
+  if (filename) {
+    const ext = filename.split(".").pop()?.toLowerCase();
+    if (ext && TEXT_EXTENSIONS.has(ext)) return true;
+  }
+  return false;
+}
+
+// Returns true for image MIME types (jpg, png, gif, webp, svg, etc.)
+// We call these out specifically in the prompt so the AI knows a visual
+// artifact exists, even though it cannot see the pixels.
+function isImageFile(mimeType, filename) {
+  if (mimeType && mimeType.toLowerCase().startsWith("image/")) return true;
+  const imageExts = new Set(["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "ico", "tiff", "heic"]);
+  if (filename) {
+    const ext = filename.split(".").pop()?.toLowerCase();
+    if (ext && imageExts.has(ext)) return true;
+  }
+  return false;
+}
+
+// Fetches the raw content of a Jira attachment by its numeric ID.
+// Uses the Jira REST API v3 attachment content endpoint, which returns the
+// raw binary (or text) of the file — we decode it as UTF-8 text.
+// On any error (network, permission, too-large file), returns null so the
+// caller can fall back to the metadata-only label gracefully.
+async function fetchAttachmentText(attachmentId, maxChars) {
+  try {
+    // The Jira REST API endpoint for downloading raw attachment content.
+    // Note: ?redirect=false tells Jira to give us the content directly,
+    // not issue a redirect to a CDN — which Forge's sandbox can't follow.
+    const res = await api
+      .asUser()
+      .requestJira(route`/rest/api/3/attachment/content/${attachmentId}?redirect=false`);
+
+    if (!res.ok) {
+      console.warn(`Attachment ${attachmentId} content fetch returned ${res.status}`);
+      return null;
+    }
+
+    // Read the response body as text (UTF-8). We don't parse it further —
+    // log files, JSON, Markdown, source code — all are valuable as raw text.
+    const rawText = await res.text();
+    if (!rawText || !rawText.trim()) return null;
+
+    // Truncate to our budget. We append a note so the AI knows it was cut.
+    return truncateText(rawText.trim(), maxChars);
+  } catch (err) {
+    console.warn(`Could not fetch attachment ${attachmentId} content:`, err.message);
+    return null;
+  }
+}
+
 // Maximum total comments included directly in the AI prompt. For large threads
 // (e.g. 20-100+ comments), we preserve the first 5 (initial context/triage)
 // and the last 15 (resolution/verification), inserting a brief summary note
@@ -50,7 +140,7 @@ function extractUrlsFromADF(adf) {
   const urls = [];
   const walk = (node) => {
     if (!node) return;
-    if (node.type === "inlineCard" && node.attrs?.url) {
+    if ((node.type === "inlineCard" || node.type === "blockCard") && node.attrs?.url) {
       urls.push(node.attrs.url);
     }
     if (node.marks && Array.isArray(node.marks)) {
@@ -68,7 +158,8 @@ function extractUrlsFromADF(adf) {
   return urls;
 }
 
-// Extracts Confluence Page ID from common Confluence Cloud URL structures
+// Extracts Confluence Page ID from common Confluence Cloud URL structures,
+// including standard space URLs, viewpage action URLs, and Confluence short/tiny URLs (/wiki/x/...)
 function extractConfluencePageId(url) {
   if (!url || typeof url !== "string") return null;
   // Pattern 1: /wiki/spaces/KEY/pages/1234567/Page+Title
@@ -77,6 +168,22 @@ function extractConfluencePageId(url) {
   // Pattern 2: /wiki/pages/viewpage.action?pageId=1234567
   const m2 = url.match(/[?&]pageId=(\d+)/i);
   if (m2) return m2[1];
+  // Pattern 3: Confluence Tiny URL (/wiki/x/<shortKey>) - base64 little-endian encoded 32-bit ID
+  const m3 = url.match(/\/wiki\/x\/([A-Za-z0-9_-]+)/i);
+  if (m3) {
+    try {
+      const b64 = m3[1].replace(/-/g, "+").replace(/_/g, "/");
+      const padded = b64 + "===".slice((b64.length + 3) % 4);
+      const buf = Buffer.from(padded, "base64");
+      let id = 0;
+      for (let i = 0; i < buf.length; i++) {
+        id += buf[i] * Math.pow(256, i);
+      }
+      if (id > 0) return String(id);
+    } catch (e) {
+      // ignore decode error and return null
+    }
+  }
   return null;
 }
 
@@ -164,7 +271,7 @@ function computeContentFingerprint({
     status || "",
     resolution || "",
     ...comments.map((c) => `${c.id}|${c.created}|${c.text}`),
-    ...attachments.map((a) => `${a.id}|${a.filename}|${a.size}`),
+    ...attachments.map((a) => `${a.id}|${a.filename}|${a.size}|${a.content?.slice(0, 50) ?? ""}`),
     ...transitions.map((t) => `${t.field}|${t.from}|${t.to}|${t.created}`),
     ...confluencePages.map(
       (cp) => `${cp.pageId}|${cp.title}|${cp.text.slice(0, 50)}`,
@@ -245,14 +352,32 @@ resolver.define("getIssueContext", async (req) => {
     }));
 
     const rawAttachments = issue.fields?.attachment || [];
-    const attachments = rawAttachments.map((a) => ({
+
+    // Build base metadata objects first, then enrich text-readable files
+    // with their actual content fetched in parallel. Images, PDFs, and
+    // binary blobs fall back to metadata-only — the AI is text-only.
+    const baseAttachments = rawAttachments.map((a) => ({
       id: a.id,
       filename: a.filename,
       mimeType: a.mimeType,
       size: a.size,
       author: a.author?.displayName || "Unknown",
       created: a.created,
+      content: null,       // populated below for text-readable files
+      canReadContent: isTextReadable(a.mimeType, a.filename),
+      isImage: isImageFile(a.mimeType, a.filename),
     }));
+
+    // Fetch readable attachment text in parallel (all at once). If a fetch
+    // fails for any file, that file silently falls back to metadata-only —
+    // no error is shown to the user.
+    const attachments = await Promise.all(
+      baseAttachments.map(async (a) => {
+        if (!a.canReadContent) return a; // image/PDF/binary — skip fetch
+        const content = await fetchAttachmentText(a.id, MAX_ATTACHMENT_CHARS);
+        return { ...a, content };
+      }),
+    );
 
     const rawHistories = issue.changelog?.histories || [];
     const transitions = [];
@@ -462,6 +587,21 @@ function buildSourceList({
     });
   }
 
+  // Confluence documentation is placed prominently right after description
+  // so the AI gives equal first-class weight to official post-mortems and specs.
+  if (selection.confluence && confluencePages.length > 0) {
+    confluencePages.forEach((cp, i) => {
+      sources.push({
+        type: "confluence",
+        label: `Confluence Doc ${i + 1} — ${cp.title}`,
+        text: `Document "${cp.title}":\n${cp.text}`,
+        commentId: null,
+        attachmentId: null,
+        confluenceUrl: cp.url,
+      });
+    });
+  }
+
   if (selection.comments) {
     if (comments.length === 0) {
       sources.push({
@@ -544,10 +684,28 @@ function buildSourceList({
     } else {
       attachments.forEach((a, i) => {
         const sizeKb = Math.round((a.size || 0) / 1024);
+        // Build the text shown to the AI and in the citation modal.
+        // Three cases:
+        //   1. Text-readable file with content fetched → show actual file content.
+        //   2. Image file → note that it's a visual artifact (AI can't see pixels).
+        //   3. Binary/PDF/unknown → metadata-only label (filename, size, type).
+        let text;
+        if (a.canReadContent && a.content) {
+          // The AI gets the real file contents — most useful case.
+          text = `File "${a.filename}" (${a.mimeType || "text"}, ${sizeKb} KB) uploaded by ${a.author} on ${a.created?.slice(0, 10)}.\n\nContents:\n${a.content}`;
+        } else if (a.isImage) {
+          // Image: flag it so the AI knows a visual was attached, even though
+          // it cannot see the image itself. It may still reference the filename
+          // as evidence (e.g. "a screenshot named error-state.png was attached").
+          text = `Image file "${a.filename}" (${a.mimeType || "image"}, ${sizeKb} KB) uploaded by ${a.author} on ${a.created?.slice(0, 10)}. Note: image content cannot be read — only the filename and metadata are available.`;
+        } else {
+          // Binary/PDF/other: metadata-only, same as before.
+          text = `File "${a.filename}" (${a.mimeType || "unknown"}, ${sizeKb} KB) uploaded by ${a.author} on ${a.created?.slice(0, 10)}.`;
+        }
         sources.push({
           type: "attachment",
           label: `Attachment ${i + 1} — ${a.filename}`,
-          text: `File "${a.filename}" (${a.mimeType || "unknown"}, ${sizeKb} KB) uploaded by ${a.author} on ${a.created?.slice(0, 10)}.`,
+          text,
           commentId: null,
           attachmentId: a.id || null,
           confluenceUrl: null,
@@ -578,19 +736,6 @@ function buildSourceList({
         });
       });
     }
-  }
-
-  if (selection.confluence && confluencePages.length > 0) {
-    confluencePages.forEach((cp, i) => {
-      sources.push({
-        type: "confluence",
-        label: `Confluence Doc ${i + 1} — ${cp.title}`,
-        text: `Document "${cp.title}":\n${cp.text}`,
-        commentId: null,
-        attachmentId: null,
-        confluenceUrl: cp.url,
-      });
-    });
   }
 
   return sources;
@@ -689,10 +834,12 @@ function buildPrompt({ issueKey, title, status, resolution, sources }) {
     `}`,
     ``,
     `Rules:`,
+    `- EQUAL PRIORITY ACROSS ALL SOURCES: You MUST treat all source categories (Confluence documentation, Code/Log attachments, Comments, Description, Status history) with EQUAL weight. Do not favor comments over documentation or attachments over Confluence.`,
+    `- MULTI-SOURCE SYNTHESIS: Strive to actively cross-cite across multiple different source types! For instance: cite the linked Confluence page for post-mortem/architecture context, cite the attachment for code bug/fix/log proof, and cite comments for team rollout/verification.`,
     `- Use a SINGLE "paragraph" block for simple, short explanations (most cases).`,
     `- Use a "bullets" block ONLY when the issue involved several distinct comments, sources, or a genuinely multi-step chain of events that is clearer as separate points. Don't force bullets when one or two sentences would do.`,
     `- You may mix one paragraph block followed by one bullets block (e.g. a one-line lead-in, then supporting points) if that reads best — but never more than 2 blocks total.`,
-    `- Keep the total word count across all blocks under about 60 words. Brevity matters more than completeness.`,
+    `- Keep the total word count across all blocks under about 85 words.`,
     `- Keep each citation "reason" to at most 12 words.`,
     `- Only cite source numbers that actually exist in the list above.`,
     `- Every citation marker used anywhere in "body" must have a matching entry in "citations".`,
