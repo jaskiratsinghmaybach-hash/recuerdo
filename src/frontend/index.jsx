@@ -23,19 +23,19 @@ import ForgeReconciler, {
 } from "@forge/react";
 import { invoke, view } from "@forge/bridge";
 
-// Display labels for each source category in the filter panel. Add an entry
-// here (and a matching default in the resolver's DEFAULT_SELECTION) when a
-// new source type, like Confluence pages, is introduced.
+// Display labels for each source category in the filter panel.
 const SOURCE_CATEGORY_LABELS = {
   description: "Issue description",
   comments: "Comments",
+  attachments: "Attachments",
+  history: "Status changelog",
+  confluence: "Confluence pages",
 };
 
 // Per-source-type styling for inline citation markers: icon glyph plus a
 // distinct accent color, so each citation reads as a small colored pill
 // badge (not a bare bracketed number) and visually hints at its source type
-// before the user even clicks it. Falls back to a neutral/link style for
-// any future source type we haven't special-cased yet.
+// before the user even clicks it.
 const SOURCE_TYPE_STYLES = {
   comment: {
     glyph: "comment",
@@ -46,6 +46,21 @@ const SOURCE_TYPE_STYLES = {
     glyph: "document",
     background: "color.background.accent.green.subtler",
     border: "color.border.accent.green",
+  },
+  attachment: {
+    glyph: "attachment",
+    background: "color.background.accent.orange.subtler",
+    border: "color.border.accent.orange",
+  },
+  history: {
+    glyph: "time",
+    background: "color.background.accent.purple.subtler",
+    border: "color.border.accent.purple",
+  },
+  confluence: {
+    glyph: "page",
+    background: "color.background.accent.teal.subtler",
+    border: "color.border.accent.teal",
   },
 };
 const DEFAULT_SOURCE_STYLE = {
@@ -261,12 +276,18 @@ const App = () => {
     }))
     .filter((entry) => entry.source);
 
-  const buildJiraUrl = (source) =>
-    source && siteUrl && issueKey
-      ? source.commentId
+  const buildSourceUrl = (source) => {
+    if (!source) return null;
+    if (source.type === "confluence" && source.confluenceUrl) {
+      return source.confluenceUrl;
+    }
+    if (siteUrl && issueKey) {
+      return source.commentId
         ? `${siteUrl}/browse/${issueKey}?focusedCommentId=${source.commentId}`
-        : `${siteUrl}/browse/${issueKey}`
-      : null;
+        : `${siteUrl}/browse/${issueKey}`;
+    }
+    return null;
+  };
 
   return (
     <Stack space="space.200">
@@ -338,12 +359,7 @@ const App = () => {
 
       <Stack space="space.075">
         <Heading size="small">Why this was resolved</Heading>
-        {!hasComments && !context.description && (
-          <Text>
-            No description or comments on this issue yet — nothing to summarize.
-          </Text>
-        )}
-        {(hasComments || context.description) && context.aiHeading && (
+        {context.aiHeading && (
           <SectionMessage appearance="information">
             <Stack space="space.100">
               <Text weight="bold">{context.aiHeading}</Text>
@@ -360,18 +376,18 @@ const App = () => {
             </Stack>
           </SectionMessage>
         )}
-        {(hasComments || context.description) &&
-          !context.aiHeading &&
-          context.aiError && (
-            <SectionMessage appearance="warning">
-              <Text>
-                Couldn't generate a summary right now: {context.aiError}
-              </Text>
-            </SectionMessage>
-          )}
-        {(hasComments || context.description) &&
-          !context.aiHeading &&
-          !context.aiError && <Text>No summary available.</Text>}
+        {!context.aiHeading && context.aiError && (
+          <SectionMessage appearance="warning">
+            <Text>
+              Couldn't generate a summary right now: {context.aiError}
+            </Text>
+          </SectionMessage>
+        )}
+        {!context.aiHeading && !context.aiError && (
+          <Text>
+            No description, comments, or activity available to summarize.
+          </Text>
+        )}
       </Stack>
 
       <ModalTransition>
@@ -387,7 +403,7 @@ const App = () => {
             <ModalBody>
               <Stack space="space.200">
                 {activeEntries.map((entry, i) => {
-                  const jiraUrl = buildJiraUrl(entry.source);
+                  const sourceUrl = buildSourceUrl(entry.source);
                   return (
                     <Stack key={i} space="space.100">
                       {activeEntries.length > 1 && (
@@ -402,14 +418,16 @@ const App = () => {
                           <Text>{entry.reason}</Text>
                         </SectionMessage>
                       )}
-                      {jiraUrl && (
+                      {sourceUrl && (
                         <Inline>
                           <LinkButton
-                            href={jiraUrl}
+                            href={sourceUrl}
                             target="_blank"
                             appearance="default"
                           >
-                            View in Jira
+                            {entry.source.type === "confluence"
+                              ? "View in Confluence"
+                              : "View in Jira"}
                           </LinkButton>
                         </Inline>
                       )}

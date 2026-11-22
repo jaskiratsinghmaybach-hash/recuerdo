@@ -50,3 +50,7 @@ Thumbs.db
 
 
 /.forge/
+
+# Internal project progress tracker (never commit to git)
+PROJECT_TRACKER.md
+

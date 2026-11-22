@@ -17,12 +17,128 @@ function selectionKeyFor(issueKey) {
   return `source-selection#${issueKey}`;
 }
 
-// Every known source category and whether it's included by default. New
-// source types (e.g. Confluence pages) get added here when they're built.
+// Every known source category and whether it's included by default.
 const DEFAULT_SELECTION = {
   description: true,
   comments: true,
+  attachments: true,
+  history: true,
+  confluence: true,
 };
+
+// Maximum characters allowed per comment in the AI prompt. Large logs or
+// stack traces pasted into comments are truncated to preserve token budget.
+const MAX_COMMENT_CHARS = 1200;
+
+// Maximum total comments included directly in the AI prompt. For large threads
+// (e.g. 20-100+ comments), we preserve the first 5 (initial context/triage)
+// and the last 15 (resolution/verification), inserting a brief summary note
+// for omitted intermediate comments.
+const MAX_COMMENTS_IN_PROMPT = 20;
+const HEAD_COMMENTS_COUNT = 5;
+const TAIL_COMMENTS_COUNT = 15;
+
+function truncateText(text, maxChars) {
+  if (!text || text.length <= maxChars) return text || "";
+  const remaining = text.length - maxChars;
+  return `${text.slice(0, maxChars)}\n[...truncated ${remaining} characters of logs/stacktrace...]`;
+}
+
+// Walks Atlassian Document Format (ADF) nodes and extracts any external or card URLs
+function extractUrlsFromADF(adf) {
+  if (!adf || !adf.content) return [];
+  const urls = [];
+  const walk = (node) => {
+    if (!node) return;
+    if (node.type === "inlineCard" && node.attrs?.url) {
+      urls.push(node.attrs.url);
+    }
+    if (node.marks && Array.isArray(node.marks)) {
+      node.marks.forEach((m) => {
+        if (m.type === "link" && m.attrs?.href) {
+          urls.push(m.attrs.href);
+        }
+      });
+    }
+    if (node.content && Array.isArray(node.content)) {
+      node.content.forEach(walk);
+    }
+  };
+  walk(adf);
+  return urls;
+}
+
+// Extracts Confluence Page ID from common Confluence Cloud URL structures
+function extractConfluencePageId(url) {
+  if (!url || typeof url !== "string") return null;
+  // Pattern 1: /wiki/spaces/KEY/pages/1234567/Page+Title
+  const m1 = url.match(/\/wiki\/spaces\/[^\/]+\/pages\/(\d+)/i);
+  if (m1) return m1[1];
+  // Pattern 2: /wiki/pages/viewpage.action?pageId=1234567
+  const m2 = url.match(/[?&]pageId=(\d+)/i);
+  if (m2) return m2[1];
+  return null;
+}
+
+// Fetches a Confluence page summary with graceful fallback if inaccessible
+async function fetchConfluencePageSummary(pageId, fullUrl) {
+  try {
+    const res = await api
+      .asUser()
+      .requestConfluence(route`/wiki/api/v2/pages/${pageId}?body-format=storage`);
+
+    if (res.ok) {
+      const data = await res.json();
+      const title = data.title || "Linked Confluence Page";
+      const rawBody = data.body?.storage?.value || "";
+      const plainText = rawBody
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      return {
+        pageId,
+        title,
+        url: fullUrl,
+        text: truncateText(plainText || "(Page has no text content)", 1000),
+      };
+    }
+
+    // Fallback to REST API v1 if v2 isn't available
+    const v1Res = await api
+      .asUser()
+      .requestConfluence(route`/wiki/rest/api/content/${pageId}?expand=body.view`);
+    if (v1Res.ok) {
+      const v1Data = await v1Res.json();
+      const title = v1Data.title || "Linked Confluence Page";
+      const rawBody = v1Data.body?.view?.value || "";
+      const plainText = rawBody
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      return {
+        pageId,
+        title,
+        url: fullUrl,
+        text: truncateText(plainText || "(Page has no text content)", 1000),
+      };
+    }
+
+    return {
+      pageId,
+      title: "Linked Confluence Page",
+      url: fullUrl,
+      text: `(Linked Confluence page could not be accessed. Status: ${res.status})`,
+    };
+  } catch (err) {
+    console.warn(`Could not access Confluence page ${pageId}:`, err.message);
+    return {
+      pageId,
+      title: "Linked Confluence Page",
+      url: fullUrl,
+      text: `(Linked Confluence page could not be accessed: ${err.message})`,
+    };
+  }
+}
 
 // A lightweight, dependency-free fingerprint of everything that could
 // change the AI's answer: the description text, status, resolution, and
@@ -39,12 +155,20 @@ function computeContentFingerprint({
   status,
   resolution,
   comments,
+  attachments = [],
+  transitions = [],
+  confluencePages = [],
 }) {
   const parts = [
     description || "",
     status || "",
     resolution || "",
     ...comments.map((c) => `${c.id}|${c.created}|${c.text}`),
+    ...attachments.map((a) => `${a.id}|${a.filename}|${a.size}`),
+    ...transitions.map((t) => `${t.field}|${t.from}|${t.to}|${t.created}`),
+    ...confluencePages.map(
+      (cp) => `${cp.pageId}|${cp.title}|${cp.text.slice(0, 50)}`,
+    ),
   ];
   const combined = parts.join("\u0001"); // unlikely separator, avoids accidental collisions between fields
 
@@ -98,11 +222,11 @@ resolver.define("getIssueContext", async (req) => {
   try {
     const storedSelection = await kvs.get(selectionKeyFor(issueKey));
     const selection = { ...DEFAULT_SELECTION, ...(storedSelection || {}) };
-    // Fetch the issue itself (status, summary, description, resolution)
+    // Fetch the issue itself (status, summary, description, resolution, attachments, changelog)
     const issueRes = await api
       .asUser()
       .requestJira(
-        route`/rest/api/3/issue/${issueKey}?fields=summary,status,resolution,description`,
+        route`/rest/api/3/issue/${issueKey}?fields=summary,status,resolution,description,attachment&expand=changelog`,
       );
     const issue = await issueRes.json();
 
@@ -120,10 +244,69 @@ resolver.define("getIssueContext", async (req) => {
       text: extractTextFromADF(c.body),
     }));
 
+    const rawAttachments = issue.fields?.attachment || [];
+    const attachments = rawAttachments.map((a) => ({
+      id: a.id,
+      filename: a.filename,
+      mimeType: a.mimeType,
+      size: a.size,
+      author: a.author?.displayName || "Unknown",
+      created: a.created,
+    }));
+
+    const rawHistories = issue.changelog?.histories || [];
+    const transitions = [];
+    rawHistories.forEach((h) => {
+      const author = h.author?.displayName || "Unknown";
+      const created = h.created;
+      (h.items || []).forEach((item) => {
+        if (item.field === "status" || item.field === "resolution") {
+          transitions.push({
+            field: item.field,
+            from: item.fromString || "(none)",
+            to: item.toString || "(none)",
+            author,
+            created,
+          });
+        }
+      });
+    });
+
     const title = issue.fields?.summary;
     const status = issue.fields?.status?.name;
     const resolution = issue.fields?.resolution?.name || null;
     const description = extractTextFromADF(issue.fields?.description);
+
+    // Scan for linked Confluence page URLs across description and comments
+    const rawConfluenceUrls = [
+      ...extractUrlsFromADF(issue.fields?.description),
+      ...(commentsData.comments || []).flatMap((c) =>
+        extractUrlsFromADF(c.body),
+      ),
+    ];
+    // Also scan plain text regex for /wiki/ links
+    const wikiRegex =
+      /https:\/\/[a-zA-Z0-9-]+\.atlassian\.net\/wiki\/[^\s"')\]]+/g;
+    const allText = `${description} ${comments.map((c) => c.text).join(" ")}`;
+    let textMatch;
+    while ((textMatch = wikiRegex.exec(allText)) !== null) {
+      rawConfluenceUrls.push(textMatch[0]);
+    }
+
+    const uniqueConfluenceMap = new Map();
+    for (const url of rawConfluenceUrls) {
+      const pageId = extractConfluencePageId(url);
+      if (pageId && !uniqueConfluenceMap.has(pageId)) {
+        uniqueConfluenceMap.set(pageId, url);
+      }
+    }
+
+    // Fetch Confluence page summaries in parallel (up to 3 max to protect latency)
+    const confluencePages = await Promise.all(
+      Array.from(uniqueConfluenceMap.entries())
+        .slice(0, 3)
+        .map(([pageId, url]) => fetchConfluencePageSummary(pageId, url)),
+    );
 
     // The AI result stays exactly as-is until the user explicitly clicks
     // the refresh/apply button — a plain panel load/remount NEVER triggers
@@ -137,6 +320,9 @@ resolver.define("getIssueContext", async (req) => {
       status,
       resolution,
       comments,
+      attachments,
+      transitions,
+      confluencePages,
     });
     const cached = await kvs.get(cacheKey);
     let aiResult;
@@ -168,42 +354,51 @@ resolver.define("getIssueContext", async (req) => {
       // actually changed (content, or which sources are selected) — this
       // is the only branch that spends an AI call, using the user's
       // current (live) selection, since that's what's being applied now.
-      const sourcesForGeneration = buildSourceList({
-        description,
-        comments,
-        selection,
-      });
-      aiResult = await getAiSummary({
-        issueKey,
-        title,
-        status,
-        resolution,
-        sources: sourcesForGeneration,
-      });
-      // Only cache a usable result — don't cache transient errors, so the
-      // next attempt gets a real chance to succeed instead of being stuck
-      // replaying a stored failure.
-      if (aiResult.heading) {
-        aiResult = { ...aiResult, fingerprint: currentFingerprint, selection };
-        await kvs.set(cacheKey, aiResult);
+      
+      const hasAnyContent =
+        Boolean(description) ||
+        comments.length > 0 ||
+        attachments.length > 0 ||
+        transitions.length > 0 ||
+        confluencePages.length > 0;
+
+      if (!hasAnyContent) {
+        aiResult = { heading: null, body: [], citations: [] };
+      } else {
+        const sourcesForGeneration = buildSourceList({
+          description,
+          comments,
+          attachments,
+          transitions,
+          confluencePages,
+          selection,
+        });
+        aiResult = await getAiSummary({
+          issueKey,
+          title,
+          status,
+          resolution,
+          sources: sourcesForGeneration,
+        });
+        // Only cache a usable result — don't cache transient errors, so the
+        // next attempt gets a real chance to succeed instead of being stuck
+        // replaying a stored failure.
+        if (aiResult.heading) {
+          aiResult = { ...aiResult, fingerprint: currentFingerprint, selection };
+          await kvs.set(cacheKey, aiResult);
+        }
       }
       appliedSelection = selection;
     }
 
-    // NOTE: we deliberately do NOT build a full browsable URL here. Jira's
-    // own "self" field on the issue/comment objects can be an internal
-    // api.atlassian.com proxy URL rather than the real public site domain
-    // (e.g. https://api.atlassian.com/ex/jira/<cloudId>/rest/api/3/...),
-    // which produces a broken link if used directly. The frontend's
-    // view.getContext() call already returns a reliable siteUrl for the
-    // real domain, so each source only carries the relative piece
-    // (focusedCommentId, if any) and the frontend builds the full URL.
-    //
     // Built from appliedSelection (what actually produced aiResult), not
     // the live `selection` — see note above.
     const sources = buildSourceList({
       description,
       comments,
+      attachments,
+      transitions,
+      confluencePages,
       selection: appliedSelection,
     });
 
@@ -246,7 +441,14 @@ resolver.define("getIssueContext", async (req) => {
 // the issue key to build the full "View in Jira" deep link
 // (?focusedCommentId=<id>), opened in a new tab — same-tab navigation to a
 // focusedCommentId is a known Jira Cloud limitation (JRACLOUD-77216).
-function buildSourceList({ description, comments, selection }) {
+function buildSourceList({
+  description,
+  comments,
+  attachments = [],
+  transitions = [],
+  confluencePages = [],
+  selection,
+}) {
   const sources = [];
 
   if (selection.description) {
@@ -255,6 +457,8 @@ function buildSourceList({ description, comments, selection }) {
       label: "Issue description",
       text: description || "(No description was written on this issue.)",
       commentId: null,
+      attachmentId: null,
+      confluenceUrl: null,
     });
   }
 
@@ -265,17 +469,128 @@ function buildSourceList({ description, comments, selection }) {
         label: "Comments",
         text: "(No comments have been posted on this issue.)",
         commentId: null,
+        attachmentId: null,
+        confluenceUrl: null,
       });
-    } else {
+    } else if (comments.length <= MAX_COMMENTS_IN_PROMPT) {
       comments.forEach((c, i) => {
         sources.push({
           type: "comment",
           label: `Comment ${i + 1} — ${c.author}`,
-          text: c.text,
+          text: truncateText(c.text, MAX_COMMENT_CHARS),
           commentId: c.id || null,
+          attachmentId: null,
+          confluenceUrl: null,
+        });
+      });
+    } else {
+      // Long comment thread (e.g. 20+ comments):
+      // Keep first HEAD_COMMENTS_COUNT comments (initial triage / discovery)
+      for (let i = 0; i < HEAD_COMMENTS_COUNT; i++) {
+        const c = comments[i];
+        sources.push({
+          type: "comment",
+          label: `Comment ${i + 1} — ${c.author}`,
+          text: truncateText(c.text, MAX_COMMENT_CHARS),
+          commentId: c.id || null,
+          attachmentId: null,
+          confluenceUrl: null,
+        });
+      }
+
+      // Add middle-omitted source note
+      const omittedCount =
+        comments.length - (HEAD_COMMENTS_COUNT + TAIL_COMMENTS_COUNT);
+      if (omittedCount > 0) {
+        sources.push({
+          type: "comment",
+          label: `Comments ${HEAD_COMMENTS_COUNT + 1} to ${HEAD_COMMENTS_COUNT + omittedCount} (Omitted)`,
+          text: `(${omittedCount} intermediate discussion comments omitted for brevity. Focus on initial triage and final resolution.)`,
+          commentId: null,
+          attachmentId: null,
+          confluenceUrl: null,
+        });
+      }
+
+      // Keep last TAIL_COMMENTS_COUNT comments (decision, fix confirmation, deploy notes)
+      const tailStartIndex = Math.max(
+        HEAD_COMMENTS_COUNT,
+        comments.length - TAIL_COMMENTS_COUNT,
+      );
+      for (let i = tailStartIndex; i < comments.length; i++) {
+        const c = comments[i];
+        sources.push({
+          type: "comment",
+          label: `Comment ${i + 1} — ${c.author}`,
+          text: truncateText(c.text, MAX_COMMENT_CHARS),
+          commentId: c.id || null,
+          attachmentId: null,
+          confluenceUrl: null,
+        });
+      }
+    }
+  }
+
+  if (selection.attachments) {
+    if (attachments.length === 0) {
+      sources.push({
+        type: "attachment",
+        label: "Attachments",
+        text: "(No attachments were uploaded to this issue.)",
+        commentId: null,
+        attachmentId: null,
+        confluenceUrl: null,
+      });
+    } else {
+      attachments.forEach((a, i) => {
+        const sizeKb = Math.round((a.size || 0) / 1024);
+        sources.push({
+          type: "attachment",
+          label: `Attachment ${i + 1} — ${a.filename}`,
+          text: `File "${a.filename}" (${a.mimeType || "unknown"}, ${sizeKb} KB) uploaded by ${a.author} on ${a.created?.slice(0, 10)}.`,
+          commentId: null,
+          attachmentId: a.id || null,
+          confluenceUrl: null,
         });
       });
     }
+  }
+
+  if (selection.history) {
+    if (transitions.length === 0) {
+      sources.push({
+        type: "history",
+        label: "Status changelog",
+        text: "(No status or resolution transitions recorded.)",
+        commentId: null,
+        attachmentId: null,
+        confluenceUrl: null,
+      });
+    } else {
+      transitions.forEach((t, i) => {
+        sources.push({
+          type: "history",
+          label: `Transition ${i + 1} — ${t.field} (${t.author})`,
+          text: `On ${t.created?.slice(0, 16).replace("T", " ")}, ${t.author} updated ${t.field} from "${t.from}" to "${t.to}".`,
+          commentId: null,
+          attachmentId: null,
+          confluenceUrl: null,
+        });
+      });
+    }
+  }
+
+  if (selection.confluence && confluencePages.length > 0) {
+    confluencePages.forEach((cp, i) => {
+      sources.push({
+        type: "confluence",
+        label: `Confluence Doc ${i + 1} — ${cp.title}`,
+        text: `Document "${cp.title}":\n${cp.text}`,
+        commentId: null,
+        attachmentId: null,
+        confluenceUrl: cp.url,
+      });
+    });
   }
 
   return sources;
