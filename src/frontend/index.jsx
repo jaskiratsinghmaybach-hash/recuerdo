@@ -20,16 +20,19 @@ import ForgeReconciler, {
   Checkbox,
   Box,
   xcss,
+  Textfield,
+  Spinner,
+  Tooltip,
 } from "@forge/react";
 import { invoke, view } from "@forge/bridge";
 
 // Display labels for each source category in the filter panel.
 const SOURCE_CATEGORY_LABELS = {
   description: "Issue description",
+  confluence: "Confluence pages",
   comments: "Comments",
   attachments: "Attachments",
   history: "Status changelog",
-  confluence: "Confluence pages",
 };
 
 // Per-source-type styling for inline citation markers: icon glyph plus a
@@ -80,7 +83,6 @@ function styleForSourceType(type) {
 // per marker — this is the fix for icon clutter when several sources
 // support the same claim right next to each other.
 function splitIntoPartsWithGroupedCitations(text) {
-  // First pass: tokenize into plain-text runs and individual marker numbers.
   const tokens = [];
   const regex = /\[(\d+)\]/g;
   let lastIndex = 0;
@@ -97,8 +99,6 @@ function splitIntoPartsWithGroupedCitations(text) {
     tokens.push({ type: "text", value: text.slice(lastIndex) });
   }
 
-  // Second pass: merge a marker with any immediately-following markers that
-  // are separated only by whitespace (no other text) into one citation group.
   const parts = [];
   let i = 0;
   while (i < tokens.length) {
@@ -108,8 +108,6 @@ function splitIntoPartsWithGroupedCitations(text) {
       i++;
       continue;
     }
-    // token.type === 'marker' — start a new group and absorb any markers
-    // that follow, skipping over whitespace-only text tokens in between.
     const group = [token.value];
     let j = i + 1;
     while (j < tokens.length) {
@@ -117,9 +115,9 @@ function splitIntoPartsWithGroupedCitations(text) {
         group.push(tokens[j].value);
         j++;
       } else if (tokens[j].type === "text" && tokens[j].value.trim() === "") {
-        j++; // whitespace between adjacent markers — keep looking
+        j++;
       } else {
-        break; // real text content — group ends here
+        break;
       }
     }
     parts.push({ type: "citation-group", markers: group });
@@ -129,49 +127,55 @@ function splitIntoPartsWithGroupedCitations(text) {
   return parts;
 }
 
+// Renders text with inline clickable citation pills
+function renderTextWithCitations(text, keyPrefix, sources, onCitationClick) {
+  const parts = splitIntoPartsWithGroupedCitations(text || "");
+  return parts.map((part, i) => {
+    if (part.type === "text") {
+      return part.value;
+    }
+    const firstSource = sources[part.markers[0] - 1];
+    const style = styleForSourceType(firstSource?.type);
+    return (
+      <Pressable
+        key={`${keyPrefix}-${i}`}
+        onClick={() => onCitationClick(part.markers)}
+        padding="space.025"
+        backgroundColor={style.background}
+        xcss={xcss({
+          borderRadius: "radius.full",
+          borderStyle: "solid",
+          borderWidth: "border.width",
+          borderColor: style.border,
+        })}
+      >
+        <Icon
+          glyph={style.glyph}
+          label={`View ${part.markers.length > 1 ? "citation sources" : "citation source"}`}
+          size="small"
+        />
+      </Pressable>
+    );
+  });
+}
+
 // Renders one block of AI output (a paragraph or a bulleted list), resolving
 // citation marker groups into clickable pill badges via onCitationClick.
 function BodyBlock({ block, sources, onCitationClick }) {
-  const renderTextWithCitations = (text, keyPrefix) => {
-    const parts = splitIntoPartsWithGroupedCitations(text);
-    return parts.map((part, i) => {
-      if (part.type === "text") {
-        return part.value; // plain string — stays inline, no wrapping element
-      }
-      // citation-group: style the badge after its FIRST source (arbitrary
-      // but consistent choice when a group spans more than one type).
-      const firstSource = sources[part.markers[0] - 1];
-      const style = styleForSourceType(firstSource?.type);
-      return (
-        <Pressable
-          key={`${keyPrefix}-${i}`}
-          onClick={() => onCitationClick(part.markers)}
-          padding="space.025"
-          backgroundColor={style.background}
-          xcss={xcss({
-            borderRadius: "radius.full",
-            borderStyle: "solid",
-            borderWidth: "border.width",
-            borderColor: style.border,
-          })}
-        >
-          <Icon
-            glyph={style.glyph}
-            label={`View ${part.markers.length > 1 ? "citation sources" : "citation source"}`}
-            size="small"
-          />
-        </Pressable>
-      );
-    });
-  };
-
   if (block.type === "bullets") {
     return (
       <Stack space="space.050">
         {block.items.map((item, idx) => (
           <Inline key={idx} space="space.075" alignBlock="start">
             <Text>•</Text>
-            <Text>{renderTextWithCitations(item, `b${idx}`)}</Text>
+            <Text>
+              {renderTextWithCitations(
+                item,
+                `b${idx}`,
+                sources,
+                onCitationClick,
+              )}
+            </Text>
           </Inline>
         ))}
       </Stack>
@@ -179,20 +183,28 @@ function BodyBlock({ block, sources, onCitationClick }) {
   }
 
   // "paragraph"
-  return <Text>{renderTextWithCitations(block.text, "p")}</Text>;
+  return (
+    <Text>
+      {renderTextWithCitations(block.text, "p", sources, onCitationClick)}
+    </Text>
+  );
 }
 
 const App = () => {
   const [context, setContext] = useState(null);
   const [issueKey, setIssueKey] = useState(null);
   const [siteUrl, setSiteUrl] = useState(null);
+  const [currentAccountId, setCurrentAccountId] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [activeMarkers, setActiveMarkers] = useState(null); // array of marker numbers, or null if closed
   const [isFilterOpen, setIsFilterOpen] = useState(false);
-  // The user's live checkbox state. Toggling this is PURE local state —
-  // no backend call happens here at all. It only gets saved/applied when
-  // the refresh/apply button below is explicitly clicked.
   const [liveSelection, setLiveSelection] = useState(null);
+
+  // Feature 2: In-Panel Chat State
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatInput, setChatInput] = useState("");
+  const [isSendingChat, setIsSendingChat] = useState(false);
 
   const loadContext = useCallback((key, forceRefresh) => {
     return invoke("getIssueContext", { issueKey: key, forceRefresh }).then(
@@ -205,24 +217,25 @@ const App = () => {
     );
   }, []);
 
+  const loadChatHistory = useCallback((key) => {
+    invoke("getChatHistory", { issueKey: key }).then((res) => {
+      if (res?.messages) {
+        setChatMessages(res.messages);
+      }
+    });
+  }, []);
+
   useEffect(() => {
     view.getContext().then((ctx) => {
       const key = ctx.extension.issue.key;
       setIssueKey(key);
-      // siteUrl is Forge's own reliable site domain (e.g.
-      // https://one-atlas-xltb.atlassian.net) — unlike the Jira REST API's
-      // "self" fields, which can point at an internal api.atlassian.com
-      // proxy URL instead. We use this to build correct "View in Jira" links.
       setSiteUrl(ctx.siteUrl);
-      // Initial load: never forces a refresh. If a cached AI result exists
-      // from a previous session, the resolver returns it instantly with no
-      // new AI call.
+      setCurrentAccountId(ctx.accountId || null);
       loadContext(key, false);
+      loadChatHistory(key);
     });
-  }, [loadContext]);
+  }, [loadContext, loadChatHistory]);
 
-  // True when the user has toggled a checkbox since the currently-shown
-  // summary was generated — i.e. there's a pending change not yet applied.
   const hasPendingSelectionChange =
     context?.appliedSelection &&
     liveSelection &&
@@ -234,10 +247,6 @@ const App = () => {
   const handleRefreshOrApply = async () => {
     if (!issueKey || refreshing) return;
     setRefreshing(true);
-    // Save whatever the live checkbox state currently is (a no-op save if
-    // nothing changed since the last save) before asking for the result —
-    // the resolver's own fingerprint+selection check decides whether this
-    // actually needs a new AI call or can be answered from cache instantly.
     if (liveSelection) {
       await invoke("setSourceSelection", {
         issueKey,
@@ -253,6 +262,52 @@ const App = () => {
     setLiveSelection({ ...liveSelection, [category]: nextValue });
   };
 
+  const handleSendChatMessage = async () => {
+    const question = chatInput.trim();
+    if (!question || isSendingChat || !issueKey) return;
+    setChatInput("");
+    setIsSendingChat(true);
+
+    // Optimistically add user message immediately
+    const tempUserMsg = {
+      id: `temp-${Date.now()}`,
+      authorName: "You",
+      isUser: true,
+      text: question,
+      timestamp: new Date().toISOString(),
+    };
+    setChatMessages((prev) => [...prev, tempUserMsg]);
+
+    const res = await invoke("sendChatMessage", {
+      issueKey,
+      question,
+      userName: "You",
+    });
+
+    if (res?.messages) {
+      setChatMessages(res.messages);
+    } else if (res?.error) {
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: `err-${Date.now()}`,
+          authorName: "Recuerdo",
+          isUser: false,
+          text: `Couldn't answer right now: ${res.error}`,
+          citations: [],
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+    }
+    setIsSendingChat(false);
+  };
+
+  const handleClearChat = async () => {
+    if (!issueKey) return;
+    await invoke("clearChatHistory", { issueKey });
+    setChatMessages([]);
+  };
+
   if (!context) {
     return <Text>Loading...</Text>;
   }
@@ -261,18 +316,22 @@ const App = () => {
     return <Text>Error: {context.error}</Text>;
   }
 
-  const hasComments = context.comments && context.comments.length > 0;
   const sources = context.sources || [];
   const citations = context.aiCitations || [];
   const aiBody = context.aiBody || [];
 
-  // The modal can show one or several sources at once (a merged citation
-  // group). Build the list of {source, reason} pairs it needs.
+  // Combine citations across summary and all chat messages so clicking [n]
+  // anywhere displays the correct supporting reason
+  const allCitations = [
+    ...citations,
+    ...chatMessages.flatMap((m) => m.citations || []),
+  ];
+
   const activeEntries = (activeMarkers || [])
     .map((marker) => ({
       marker,
       source: sources[marker - 1],
-      reason: citations.find((c) => c.marker === marker)?.reason,
+      reason: allCitations.find((c) => c.marker === marker)?.reason,
     }))
     .filter((entry) => entry.source);
 
@@ -289,10 +348,25 @@ const App = () => {
     return null;
   };
 
+  const sectionHeadingText =
+    context.sectionTitle ||
+    (context.effectivelyResolved === false
+      ? "Where this stands"
+      : "Why this was resolved");
+
   return (
     <Stack space="space.200">
+      {/* Top Action Bar */}
       <Inline space="space.100" alignBlock="center" spread="space-between">
-        <Heading size="small">recuerdo</Heading>
+        {/* Ask AI toggle — same subtle ghost style as Sources and Refresh */}
+        <Button
+          appearance="subtle"
+          iconBefore={isChatOpen ? "cross" : "comment"}
+          onClick={() => setIsChatOpen((open) => !open)}
+        >
+          {isChatOpen ? "✕ Close" : "Ask AI"}
+        </Button>
+
         <Inline space="space.075" alignBlock="center">
           <Popup
             isOpen={isFilterOpen}
@@ -350,20 +424,60 @@ const App = () => {
         </Inline>
       </Inline>
 
-      <Stack space="space.100">
-        <Text>
-          Status: <Lozenge>{context.status}</Lozenge>
-        </Text>
-        {context.resolution && <Text>Resolution: {context.resolution}</Text>}
-      </Stack>
-
-      <Stack space="space.075">
-        <Heading size="small">Why this was resolved</Heading>
-        {context.aiHeading && (
-          <SectionMessage appearance="information">
-            <Stack space="space.100">
-              <Text weight="bold">{context.aiHeading}</Text>
+      {/* VIEW A: Normal Summary View (Chat Closed) */}
+      {!isChatOpen && (
+        <Stack space="space.075">
+          <Heading size="small">{sectionHeadingText}</Heading>
+          {context.aiHeading && (
+            <SectionMessage appearance="information">
               <Stack space="space.100">
+                <Text weight="bold">{context.aiHeading}</Text>
+                <Stack space="space.100">
+                  {aiBody.map((block, i) => (
+                    <BodyBlock
+                      key={i}
+                      block={block}
+                      sources={sources}
+                      onCitationClick={setActiveMarkers}
+                    />
+                  ))}
+                </Stack>
+              </Stack>
+            </SectionMessage>
+          )}
+          {!context.aiHeading && context.aiError && (
+            <SectionMessage appearance="warning">
+              <Text>
+                Couldn't generate a summary right now: {context.aiError}
+              </Text>
+            </SectionMessage>
+          )}
+          {!context.aiHeading && !context.aiError && (
+            <Text>
+              No description, comments, or activity available to summarize.
+            </Text>
+          )}
+        </Stack>
+      )}
+
+      {/* VIEW B: In-Panel Chat (Wireframe design — fixed height inner scroll) */}
+      {isChatOpen && (
+        <Stack space="space.100">
+
+          {/* ── Briefing card: collapsed summary pinned at top of chat ── */}
+          {context.aiHeading && (
+            <Box
+              backgroundColor="elevation.surface.sunken"
+              padding="space.100"
+              xcss={xcss({ borderRadius: "radius.medium" })}
+            >
+              <Stack space="space.050">
+                <Inline space="space.050" alignBlock="center">
+                  <Icon glyph="lightbulb" size="small" label="Briefing" />
+                  <Text weight="bold" size="small">
+                    {sectionHeadingText}: {context.aiHeading}
+                  </Text>
+                </Inline>
                 {aiBody.map((block, i) => (
                   <BodyBlock
                     key={i}
@@ -373,23 +487,232 @@ const App = () => {
                   />
                 ))}
               </Stack>
-            </Stack>
-          </SectionMessage>
-        )}
-        {!context.aiHeading && context.aiError && (
-          <SectionMessage appearance="warning">
-            <Text>
-              Couldn't generate a summary right now: {context.aiError}
-            </Text>
-          </SectionMessage>
-        )}
-        {!context.aiHeading && !context.aiError && (
-          <Text>
-            No description, comments, or activity available to summarize.
-          </Text>
-        )}
-      </Stack>
+            </Box>
+          )}
 
+          {/* ── Scrollable message list — fixed height so panel never grows ── */}
+          <Box
+            xcss={xcss({
+              height: "340px",
+              overflowY: "auto",
+              overflowX: "hidden",
+            })}
+          >
+            <Stack space="space.150" padding="space.050">
+
+              {/* Empty state hint */}
+              {chatMessages.length === 0 && !isSendingChat && (
+                <Box
+                  padding="space.100"
+                  backgroundColor="elevation.surface.sunken"
+                  xcss={xcss({ borderRadius: "radius.medium" })}
+                >
+                  <Text color="color.text.subtlest">
+                    No questions asked yet. Try: "Who was investigating this?" or "Why was this timeout chosen?"
+                  </Text>
+                </Box>
+              )}
+
+              {chatMessages.map((msg) => {
+                // Format timestamp for the tooltip label — shown on hover of avatar
+                const tooltipLabel = msg.timestamp
+                  ? new Date(msg.timestamp).toLocaleString([], {
+                      month: "short",
+                      day: "numeric",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })
+                  : "";
+
+                // ── Helper: derive initials from a display name ──
+                // "Jaskirat Singh" → "JS", "You" → "Y", "Recuerdo" → "R"
+                const initials = (name) =>
+                  (name || "?")
+                    .split(" ")
+                    .map((w) => w[0] || "")
+                    .join("")
+                    .toUpperCase()
+                    .slice(0, 2);
+
+                if (msg.isUser) {
+                  // ── RIGHT-SIDE: user message ──
+                  // Layout: [Name  JS avatar]
+                  //         [     message card]
+                  const name = msg.authorName || "You";
+                  const abbr = initials(name);
+                  return (
+                    <Stack key={msg.id} space="space.050" alignBlock="end">
+                      {/* Name + avatar row (right-aligned) */}
+                      <Inline spread="end" space="space.075" alignBlock="center">
+                        <Text size="small" color="color.text.subtle" weight="medium">
+                          {name}
+                        </Text>
+                        {/* Avatar circle with initials */}
+                        <Tooltip content={tooltipLabel || name} position="top">
+                          <Box
+                            backgroundColor="color.background.accent.blue.bolder"
+                            xcss={xcss({
+                              width: "28px",
+                              height: "28px",
+                              borderRadius: "50%",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              flexShrink: 0,
+                              cursor: "default",
+                            })}
+                          >
+                            <Text size="small" color="color.text.inverse" weight="bold">
+                              {abbr}
+                            </Text>
+                          </Box>
+                        </Tooltip>
+                      </Inline>
+                      {/* Message bubble — right-aligned, same subtle bg as AI for consistency */}
+                      <Inline spread="end">
+                        <Box
+                          backgroundColor="color.background.accent.blue.subtler"
+                          padding="space.100"
+                          xcss={xcss({
+                            borderRadius: "radius.medium",
+                            maxWidth: "85%",
+                          })}
+                        >
+                          <Text>{msg.text}</Text>
+                        </Box>
+                      </Inline>
+                    </Stack>
+                  );
+                }
+
+                // ── LEFT-SIDE: Recuerdo AI message ──
+                // Layout: [R avatar  Recuerdo]
+                //         [message card      ]
+                return (
+                  <Stack key={msg.id} space="space.050">
+                    {/* Avatar + "Recuerdo" label row */}
+                    <Inline space="space.075" alignBlock="center">
+                      {/* "R" avatar circle in teal */}
+                      <Tooltip content={tooltipLabel || "Recuerdo"} position="top">
+                        <Box
+                          backgroundColor="color.background.accent.teal.bolder"
+                          xcss={xcss({
+                            width: "28px",
+                            height: "28px",
+                            borderRadius: "50%",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            flexShrink: 0,
+                            cursor: "default",
+                          })}
+                        >
+                          <Text size="small" color="color.text.inverse" weight="bold">
+                            R
+                          </Text>
+                        </Box>
+                      </Tooltip>
+                      <Text size="small" color="color.text.subtle" weight="medium">
+                        Recuerdo
+                      </Text>
+                    </Inline>
+                    {/* AI message card — slightly sunken bg, no border, rounded */}
+                    <Box
+                      backgroundColor="elevation.surface.sunken"
+                      padding="space.100"
+                      xcss={xcss({
+                        borderRadius: "radius.medium",
+                        maxWidth: "90%",
+                      })}
+                    >
+                      <Text>
+                        {renderTextWithCitations(
+                          msg.text,
+                          msg.id,
+                          sources,
+                          setActiveMarkers,
+                        )}
+                      </Text>
+                    </Box>
+                  </Stack>
+                );
+              })}
+
+              {/* ── Thinking indicator while AI is processing ── */}
+              {isSendingChat && (
+                <Stack space="space.050">
+                  <Inline space="space.075" alignBlock="center">
+                    <Box
+                      backgroundColor="color.background.accent.teal.bolder"
+                      xcss={xcss({
+                        width: "28px",
+                        height: "28px",
+                        borderRadius: "50%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        flexShrink: 0,
+                      })}
+                    >
+                      <Text size="small" color="color.text.inverse" weight="bold">R</Text>
+                    </Box>
+                    <Text size="small" color="color.text.subtle" weight="medium">Recuerdo</Text>
+                  </Inline>
+                  <Box
+                    backgroundColor="elevation.surface.sunken"
+                    padding="space.100"
+                    xcss={xcss({ borderRadius: "radius.medium", maxWidth: "90%" })}
+                  >
+                    <Inline space="space.075" alignBlock="center">
+                      <Spinner size="small" />
+                      <Text size="small" color="color.text.subtle">
+                        Reviewing sources...
+                      </Text>
+                    </Inline>
+                  </Box>
+                </Stack>
+              )}
+
+            </Stack>
+          </Box>
+
+          {/* ── Chat input bar ── */}
+          <Inline space="space.050" alignBlock="center">
+            <Box xcss={xcss({ flexGrow: 1 })}>
+              <Textfield
+                placeholder="Your message to be sent here"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleSendChatMessage();
+                }}
+                isDisabled={isSendingChat}
+              />
+            </Box>
+            <Button
+              appearance="primary"
+              iconBefore="send"
+              isDisabled={!chatInput.trim() || isSendingChat}
+              onClick={handleSendChatMessage}
+            />
+          </Inline>
+
+          {/* ── Footer ── */}
+          <Inline spread="space-between" alignBlock="center">
+            <Text size="small" color="color.text.subtlest">
+              Shared team memory
+            </Text>
+            {chatMessages.length > 0 && (
+              <Button appearance="subtle" onClick={handleClearChat}>
+                Clear conversation
+              </Button>
+            )}
+          </Inline>
+
+        </Stack>
+      )}
+
+      {/* Interactive Citation Inspection Modal */}
       <ModalTransition>
         {activeEntries.length > 0 && (
           <Modal onClose={() => setActiveMarkers(null)}>

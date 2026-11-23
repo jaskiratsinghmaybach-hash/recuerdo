@@ -17,6 +17,12 @@ function selectionKeyFor(issueKey) {
   return `source-selection#${issueKey}`;
 }
 
+// Cache key for a given issue's shared conversation history.
+// Shared across all team members who open this issue (shared institutional memory).
+function chatKeyFor(issueKey) {
+  return `chat-history#${issueKey}`;
+}
+
 // Every known source category and whether it's included by default.
 const DEFAULT_SELECTION = {
   description: true,
@@ -319,6 +325,116 @@ resolver.define("setSourceSelection", async (req) => {
   return { selection: merged };
 });
 
+// Helper to fetch all raw Jira issue details, comments, attachments, changelog, and Confluence pages
+async function fetchIssueData(issueKey) {
+  const issueRes = await api
+    .asUser()
+    .requestJira(
+      route`/rest/api/3/issue/${issueKey}?fields=summary,status,resolution,assignee,reporter,description,attachment&expand=changelog`,
+    );
+  const issue = await issueRes.json();
+
+  const commentsRes = await api
+    .asUser()
+    .requestJira(route`/rest/api/3/issue/${issueKey}/comment`);
+  const commentsData = await commentsRes.json();
+
+  const comments = (commentsData.comments || []).map((c) => ({
+    id: c.id,
+    author: c.author?.displayName || "Unknown",
+    created: c.created,
+    text: extractTextFromADF(c.body),
+  }));
+
+  const rawAttachments = issue.fields?.attachment || [];
+  const baseAttachments = rawAttachments.map((a) => ({
+    id: a.id,
+    filename: a.filename,
+    mimeType: a.mimeType,
+    size: a.size,
+    author: a.author?.displayName || "Unknown",
+    created: a.created,
+    content: null,
+    canReadContent: isTextReadable(a.mimeType, a.filename),
+    isImage: isImageFile(a.mimeType, a.filename),
+  }));
+
+  const attachments = await Promise.all(
+    baseAttachments.map(async (a) => {
+      if (!a.canReadContent) return a;
+      const content = await fetchAttachmentText(a.id, MAX_ATTACHMENT_CHARS);
+      return { ...a, content };
+    }),
+  );
+
+  const rawHistories = issue.changelog?.histories || [];
+  const transitions = [];
+  rawHistories.forEach((h) => {
+    const author = h.author?.displayName || "Unknown";
+    const created = h.created;
+    (h.items || []).forEach((item) => {
+      if (item.field === "status" || item.field === "resolution") {
+        transitions.push({
+          field: item.field,
+          from: item.fromString || "(none)",
+          to: item.toString || "(none)",
+          author,
+          created,
+        });
+      }
+    });
+  });
+
+  const title = issue.fields?.summary || "";
+  const status = issue.fields?.status?.name || "";
+  const resolution = issue.fields?.resolution?.name || null;
+  const assignee = issue.fields?.assignee?.displayName || "Unassigned";
+  const reporter = issue.fields?.reporter?.displayName || "Unknown";
+  const description = extractTextFromADF(issue.fields?.description);
+
+  const rawConfluenceUrls = [
+    ...extractUrlsFromADF(issue.fields?.description),
+    ...(commentsData.comments || []).flatMap((c) =>
+      extractUrlsFromADF(c.body),
+    ),
+  ];
+  const wikiRegex =
+    /https:\/\/[a-zA-Z0-9-]+\.atlassian\.net\/wiki\/[^\s"')\]]+/g;
+  const allText = `${description} ${comments.map((c) => c.text).join(" ")}`;
+  let textMatch;
+  while ((textMatch = wikiRegex.exec(allText)) !== null) {
+    rawConfluenceUrls.push(textMatch[0]);
+  }
+
+  const uniqueConfluenceMap = new Map();
+  for (const url of rawConfluenceUrls) {
+    const pageId = extractConfluencePageId(url);
+    if (pageId && !uniqueConfluenceMap.has(pageId)) {
+      uniqueConfluenceMap.set(pageId, url);
+    }
+  }
+
+  const confluencePages = await Promise.all(
+    Array.from(uniqueConfluenceMap.entries())
+      .slice(0, 3)
+      .map(([pageId, url]) => fetchConfluencePageSummary(pageId, url)),
+  );
+
+  return {
+    issue,
+    title,
+    status,
+    resolution,
+    assignee,
+    reporter,
+    description,
+    comments,
+    attachments,
+    transitions,
+    confluencePages,
+  };
+}
+
 resolver.define("getIssueContext", async (req) => {
   const { issueKey, forceRefresh } = req.payload;
 
@@ -329,109 +445,20 @@ resolver.define("getIssueContext", async (req) => {
   try {
     const storedSelection = await kvs.get(selectionKeyFor(issueKey));
     const selection = { ...DEFAULT_SELECTION, ...(storedSelection || {}) };
-    // Fetch the issue itself (status, summary, description, resolution, attachments, changelog)
-    const issueRes = await api
-      .asUser()
-      .requestJira(
-        route`/rest/api/3/issue/${issueKey}?fields=summary,status,resolution,description,attachment&expand=changelog`,
-      );
-    const issue = await issueRes.json();
 
-    // Fetch comments on the issue
-    const commentsRes = await api
-      .asUser()
-      .requestJira(route`/rest/api/3/issue/${issueKey}/comment`);
-    const commentsData = await commentsRes.json();
-
-    const comments = (commentsData.comments || []).map((c) => ({
-      id: c.id,
-      author: c.author?.displayName || "Unknown",
-      created: c.created,
-      // body is Atlassian Document Format (ADF); extract plain text
-      text: extractTextFromADF(c.body),
-    }));
-
-    const rawAttachments = issue.fields?.attachment || [];
-
-    // Build base metadata objects first, then enrich text-readable files
-    // with their actual content fetched in parallel. Images, PDFs, and
-    // binary blobs fall back to metadata-only — the AI is text-only.
-    const baseAttachments = rawAttachments.map((a) => ({
-      id: a.id,
-      filename: a.filename,
-      mimeType: a.mimeType,
-      size: a.size,
-      author: a.author?.displayName || "Unknown",
-      created: a.created,
-      content: null,       // populated below for text-readable files
-      canReadContent: isTextReadable(a.mimeType, a.filename),
-      isImage: isImageFile(a.mimeType, a.filename),
-    }));
-
-    // Fetch readable attachment text in parallel (all at once). If a fetch
-    // fails for any file, that file silently falls back to metadata-only —
-    // no error is shown to the user.
-    const attachments = await Promise.all(
-      baseAttachments.map(async (a) => {
-        if (!a.canReadContent) return a; // image/PDF/binary — skip fetch
-        const content = await fetchAttachmentText(a.id, MAX_ATTACHMENT_CHARS);
-        return { ...a, content };
-      }),
-    );
-
-    const rawHistories = issue.changelog?.histories || [];
-    const transitions = [];
-    rawHistories.forEach((h) => {
-      const author = h.author?.displayName || "Unknown";
-      const created = h.created;
-      (h.items || []).forEach((item) => {
-        if (item.field === "status" || item.field === "resolution") {
-          transitions.push({
-            field: item.field,
-            from: item.fromString || "(none)",
-            to: item.toString || "(none)",
-            author,
-            created,
-          });
-        }
-      });
-    });
-
-    const title = issue.fields?.summary;
-    const status = issue.fields?.status?.name;
-    const resolution = issue.fields?.resolution?.name || null;
-    const description = extractTextFromADF(issue.fields?.description);
-
-    // Scan for linked Confluence page URLs across description and comments
-    const rawConfluenceUrls = [
-      ...extractUrlsFromADF(issue.fields?.description),
-      ...(commentsData.comments || []).flatMap((c) =>
-        extractUrlsFromADF(c.body),
-      ),
-    ];
-    // Also scan plain text regex for /wiki/ links
-    const wikiRegex =
-      /https:\/\/[a-zA-Z0-9-]+\.atlassian\.net\/wiki\/[^\s"')\]]+/g;
-    const allText = `${description} ${comments.map((c) => c.text).join(" ")}`;
-    let textMatch;
-    while ((textMatch = wikiRegex.exec(allText)) !== null) {
-      rawConfluenceUrls.push(textMatch[0]);
-    }
-
-    const uniqueConfluenceMap = new Map();
-    for (const url of rawConfluenceUrls) {
-      const pageId = extractConfluencePageId(url);
-      if (pageId && !uniqueConfluenceMap.has(pageId)) {
-        uniqueConfluenceMap.set(pageId, url);
-      }
-    }
-
-    // Fetch Confluence page summaries in parallel (up to 3 max to protect latency)
-    const confluencePages = await Promise.all(
-      Array.from(uniqueConfluenceMap.entries())
-        .slice(0, 3)
-        .map(([pageId, url]) => fetchConfluencePageSummary(pageId, url)),
-    );
+    const issueData = await fetchIssueData(issueKey);
+    const {
+      title,
+      status,
+      resolution,
+      assignee,
+      reporter,
+      description,
+      comments,
+      attachments,
+      transitions,
+      confluencePages,
+    } = issueData;
 
     // The AI result stays exactly as-is until the user explicitly clicks
     // the refresh/apply button — a plain panel load/remount NEVER triggers
@@ -488,7 +515,13 @@ resolver.define("getIssueContext", async (req) => {
         confluencePages.length > 0;
 
       if (!hasAnyContent) {
-        aiResult = { heading: null, body: [], citations: [] };
+        aiResult = {
+          heading: null,
+          body: [],
+          citations: [],
+          effectivelyResolved: true,
+          sectionTitle: "Why this was resolved",
+        };
       } else {
         const sourcesForGeneration = buildSourceList({
           description,
@@ -503,6 +536,8 @@ resolver.define("getIssueContext", async (req) => {
           title,
           status,
           resolution,
+          assignee,
+          reporter,
           sources: sourcesForGeneration,
         });
         // Only cache a usable result — don't cache transient errors, so the
@@ -531,6 +566,8 @@ resolver.define("getIssueContext", async (req) => {
       summary: title,
       status,
       resolution,
+      assignee,
+      reporter,
       comments,
       description,
       sources,
@@ -540,6 +577,12 @@ resolver.define("getIssueContext", async (req) => {
       aiBody: aiResult.body || [],
       aiCitations: aiResult.citations || [],
       aiError: aiResult.error || null,
+      effectivelyResolved: aiResult.effectivelyResolved ?? true,
+      sectionTitle:
+        aiResult.sectionTitle ||
+        (aiResult.effectivelyResolved === false
+          ? "Where this stands"
+          : "Why this was resolved"),
     };
   } catch (err) {
     console.error("Error fetching issue context:", err);
@@ -742,15 +785,16 @@ function buildSourceList({
 }
 
 // Calls the Lambda proxy (recuerdo-bedrock-proxy), which forwards the prompt
-// to whichever AI backend is currently wired up behind it (Bedrock, Gemini,
-// or Anthropic — the resolver doesn't need to know or care which).
-//
-// Contract with the Lambda proxy:
-//   Request:  POST, header "x-recuerdo-secret": <shared secret>,
-//             JSON body { prompt: string }
-//   Response: JSON body { summary: string, citations: [{marker, reason}] }
-//             on success, or { error: string } on failure.
-async function getAiSummary({ issueKey, title, status, resolution, sources }) {
+// to AWS Bedrock Mantle (DeepSeek V3 primary, Qwen fallback).
+async function getAiSummary({
+  issueKey,
+  title,
+  status,
+  resolution,
+  assignee,
+  reporter,
+  sources,
+}) {
   const proxyUrl = process.env.LAMBDA_PROXY_URL;
   const proxySecret = process.env.LAMBDA_PROXY_SECRET;
 
@@ -764,7 +808,15 @@ async function getAiSummary({ issueKey, title, status, resolution, sources }) {
     return { summary: null };
   }
 
-  const prompt = buildPrompt({ issueKey, title, status, resolution, sources });
+  const prompt = buildPrompt({
+    issueKey,
+    title,
+    status,
+    resolution,
+    assignee,
+    reporter,
+    sources,
+  });
 
   try {
     const res = await api.fetch(proxyUrl, {
@@ -773,7 +825,7 @@ async function getAiSummary({ issueKey, title, status, resolution, sources }) {
         "Content-Type": "application/json",
         "x-recuerdo-secret": proxySecret,
       },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ mode: "summary", prompt }),
     });
 
     if (!res.ok) {
@@ -790,6 +842,12 @@ async function getAiSummary({ issueKey, title, status, resolution, sources }) {
     }
 
     return {
+      effectivelyResolved: data.effectivelyResolved ?? true,
+      sectionTitle:
+        data.sectionTitle ||
+        (data.effectivelyResolved === false
+          ? "Where this stands"
+          : "Why this was resolved"),
       heading: data.heading || null,
       body: data.body || [],
       citations: data.citations || [],
@@ -800,30 +858,38 @@ async function getAiSummary({ issueKey, title, status, resolution, sources }) {
   }
 }
 
-// Builds the prompt sent to the AI model. Asks for STRUCTURED JSON output:
-// a short heading, one or more body blocks (plain paragraphs, or a bulleted
-// list when that's genuinely clearer — the AI's own judgment call, not
-// forced every time), with [n] citation markers inline in the text, plus a
-// citations array explaining why each marker was cited. The source list is
-// numbered exactly as buildSourceList() numbered it, so markers map
-// directly to sources[] on the frontend with no fuzzy matching required.
-function buildPrompt({ issueKey, title, status, resolution, sources }) {
+// Builds the prompt sent to the AI model for the primary issue summary.
+// Evaluates resolution status, team participants, and synthesizes across all sources.
+function buildPrompt({
+  issueKey,
+  title,
+  status,
+  resolution,
+  assignee,
+  reporter,
+  sources,
+}) {
   const sourceBlock = sources
     .map((s, i) => `[${i + 1}] ${s.label}:\n${s.text}`)
     .join("\n\n");
 
   return [
-    `You are summarizing why a Jira issue was closed or resolved, for a teammate who is about to re-investigate it.`,
+    `You are Recuerdo AI, an institutional-memory decision intelligence engine analyzing a Jira issue.`,
     `Issue: ${issueKey} — "${title}"`,
-    `Status: ${status}${resolution ? `, Resolution: ${resolution}` : ""}`,
+    `Ticket Status: ${status}${resolution ? `, Resolution: ${resolution}` : ""}`,
+    `Assignee: ${assignee || "Unassigned"} | Reporter: ${reporter || "Unknown"}`,
     ``,
-    `Here are the available sources, numbered:`,
+    `Here are all available sources, numbered:`,
     ``,
     sourceBlock,
     ``,
+    `First, assess whether the underlying technical problem or task is EFFECTIVELY RESOLVED based on the sources (do not blindly trust the ticket status — verify whether a solution, fix, or decision was actually achieved).`,
+    ``,
     `Respond with ONLY a JSON object (no markdown, no code fences) in this exact shape:`,
     `{`,
-    `  "heading": "A short, bold-worthy title for the decision, a few words (e.g. 'TTL/refresh mismatch').",`,
+    `  "effectivelyResolved": true,`,
+    `  "sectionTitle": "Why this was resolved",`,
+    `  "heading": "A short, bold-worthy title for the decision/status, a few words (e.g. 'Connection pool timeout misconfigured').",`,
     `  "body": [`,
     `    { "type": "paragraph", "text": "Prose text with inline citation markers like [1] or [2] placed right after each claim they support." },`,
     `    { "type": "bullets", "items": ["Point one [3]", "Point two [4]"] }`,
@@ -834,18 +900,182 @@ function buildPrompt({ issueKey, title, status, resolution, sources }) {
     `}`,
     ``,
     `Rules:`,
-    `- EQUAL PRIORITY ACROSS ALL SOURCES: You MUST treat all source categories (Confluence documentation, Code/Log attachments, Comments, Description, Status history) with EQUAL weight. Do not favor comments over documentation or attachments over Confluence.`,
-    `- MULTI-SOURCE SYNTHESIS: Strive to actively cross-cite across multiple different source types! For instance: cite the linked Confluence page for post-mortem/architecture context, cite the attachment for code bug/fix/log proof, and cite comments for team rollout/verification.`,
+    `- "effectivelyResolved": true if a fix, resolution, or final plan was confirmed; false if active, blocked, in-progress, or unresolved.`,
+    `- "sectionTitle": If resolved: "Why this was resolved". If unresolved/active/blocked: "Where this stands". If ambiguous/inconclusive: "Current investigation status".`,
+    `- If resolved: summarize why and how it was resolved, citing root-cause and fix.`,
+    `- If unresolved: summarize the current state of investigation — what was tried, what was ruled out, who last acted, what the blocker is, and recommended next action (grounded strictly in participants from ticket fields, comments, Confluence, or attachments).`,
+    `- GROUNDED TEAM ROLES: People's names and roles can appear across ANY source — the issue description, Confluence documentation, comments, ticket assignee/reporter, or attachments. Attribute actions only to real participants from the sources — never invent fictional people.`,
+    `- EQUAL PRIORITY ACROSS ALL SOURCES: You MUST treat all source categories (Confluence documentation, Code/Log attachments, Comments, Description, Status history) with EQUAL weight. Do not favor comments over documentation or attachments over Confluence. Cross-cite across multiple different source types!`,
     `- Use a SINGLE "paragraph" block for simple, short explanations (most cases).`,
     `- Use a "bullets" block ONLY when the issue involved several distinct comments, sources, or a genuinely multi-step chain of events that is clearer as separate points. Don't force bullets when one or two sentences would do.`,
-    `- You may mix one paragraph block followed by one bullets block (e.g. a one-line lead-in, then supporting points) if that reads best — but never more than 2 blocks total.`,
-    `- Keep the total word count across all blocks under about 85 words.`,
+    `- You may mix one paragraph block followed by one bullets block if that reads best — but never more than 2 blocks total.`,
+    `- Keep the total word count across all blocks under about 90 words.`,
     `- Keep each citation "reason" to at most 12 words.`,
     `- Only cite source numbers that actually exist in the list above.`,
     `- Every citation marker used anywhere in "body" must have a matching entry in "citations".`,
     `- If the sources don't contain a clear decision or reason, say so plainly in one paragraph block instead of guessing, and return an empty "citations" array.`,
   ].join("\n");
 }
+
+// Builds the prompt sent to the AI model for follow-up chat Q&A.
+function buildChatPrompt({
+  issueKey,
+  title,
+  status,
+  resolution,
+  assignee,
+  reporter,
+  sources,
+  history,
+  question,
+}) {
+  const sourceBlock = sources
+    .map((s, i) => `[${i + 1}] ${s.label}:\n${s.text}`)
+    .join("\n\n");
+
+  const recentHistory = history
+    .slice(-6)
+    .map((m) => `${m.authorName || (m.isUser ? "Teammate" : "Recuerdo")}: ${m.text}`)
+    .join("\n");
+
+  return [
+    `You are Recuerdo AI, an institutional-memory decision assistant answering follow-up questions about Jira issue ${issueKey} ("${title}").`,
+    `Status: ${status}${resolution ? `, Resolution: ${resolution}` : ""}`,
+    `Assignee: ${assignee} | Reporter: ${reporter}`,
+    ``,
+    `Here are all available sources for this issue, numbered:`,
+    sourceBlock,
+    ``,
+    recentHistory ? `Recent conversation:\n${recentHistory}\n` : ``,
+    `Teammate's question: "${question}"`,
+    ``,
+    `Respond with ONLY a JSON object (no markdown fences):`,
+    `{`,
+    `  "reply": "Your direct, clear answer citing relevant sources using inline [n] citation markers where helpful.",`,
+    `  "citations": [`,
+    `    { "marker": 1, "reason": "short explanation under 12 words" }`,
+    `  ]`,
+    `}`,
+    ``,
+    `Rules:`,
+    `- ONLY answer questions concerning this specific Jira issue, its sources, and its team context.`,
+    `- If the question is completely off-topic (e.g. weather, general jokes, unrelated tasks), politely decline and state you can only answer questions about this issue.`,
+    `- Ground all facts strictly in the numbered sources. People's names and roles can appear in description, Confluence, comments, ticket assignee/reporter, or attachments. Attribute actions only to real participants from the sources — never invent fictional people.`,
+    `- Use [n] citation markers whenever quoting or referencing facts from the sources.`,
+    `- Keep answers under 85 words. Be direct, helpful, and concise.`,
+  ].join("\n");
+}
+
+// --------------------------------------------------------------------------
+// Chat Resolver Definitions (Shared Institutional Memory)
+// --------------------------------------------------------------------------
+
+resolver.define("getChatHistory", async (req) => {
+  const { issueKey } = req.payload;
+  if (!issueKey) return { messages: [] };
+  const history = await kvs.get(chatKeyFor(issueKey));
+  return { messages: Array.isArray(history) ? history : [] };
+});
+
+resolver.define("clearChatHistory", async (req) => {
+  const { issueKey } = req.payload;
+  if (!issueKey) return { success: false, messages: [] };
+  await kvs.set(chatKeyFor(issueKey), []);
+  return { success: true, messages: [] };
+});
+
+resolver.define("sendChatMessage", async (req) => {
+  const { issueKey, question, userName } = req.payload;
+  if (!issueKey || !question || !question.trim()) {
+    return { error: "Missing issueKey or question" };
+  }
+
+  try {
+    const issueData = await fetchIssueData(issueKey);
+    const {
+      title,
+      status,
+      resolution,
+      assignee,
+      reporter,
+      description,
+      comments,
+      attachments,
+      transitions,
+      confluencePages,
+    } = issueData;
+
+    const sources = buildSourceList({
+      description,
+      comments,
+      attachments,
+      transitions,
+      confluencePages,
+      selection: DEFAULT_SELECTION,
+    });
+
+    const existingHistory = (await kvs.get(chatKeyFor(issueKey))) || [];
+
+    const chatPrompt = buildChatPrompt({
+      issueKey,
+      title,
+      status,
+      resolution,
+      assignee,
+      reporter,
+      sources,
+      history: existingHistory,
+      question: question.trim(),
+    });
+
+    const proxyUrl = process.env.LAMBDA_PROXY_URL;
+    const proxySecret = process.env.LAMBDA_PROXY_SECRET;
+
+    const res = await api.fetch(proxyUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-recuerdo-secret": proxySecret,
+      },
+      body: JSON.stringify({ mode: "chat", prompt: chatPrompt }),
+    });
+
+    if (!res.ok) {
+      return { error: `AI chat service error (status ${res.status})` };
+    }
+
+    const data = await res.json();
+    if (data.error) {
+      return { error: data.error };
+    }
+
+    const now = new Date().toISOString();
+    const userMsg = {
+      id: `u-${Date.now()}`,
+      authorName: userName || "You",
+      isUser: true,
+      text: question.trim(),
+      timestamp: now,
+    };
+
+    const aiMsg = {
+      id: `ai-${Date.now() + 1}`,
+      authorName: "Recuerdo",
+      isUser: false,
+      text: data.reply || "No response generated.",
+      citations: Array.isArray(data.citations) ? data.citations : [],
+      timestamp: new Date().toISOString(),
+    };
+
+    const updated = [...existingHistory, userMsg, aiMsg];
+    await kvs.set(chatKeyFor(issueKey), updated);
+
+    return { messages: updated };
+  } catch (err) {
+    console.error("Error in sendChatMessage:", err);
+    return { error: err.message };
+  }
+});
 
 // Minimal ADF-to-text extractor — walks the document tree and pulls text nodes
 function extractTextFromADF(adf) {

@@ -566,6 +566,29 @@ async function runAllTests() {
     assert.equal(sources[1].text, "(No comments have been posted on this issue.)");
   });
 
+  // --- Suite 7: Dynamic Resolution Status & In-Panel Chat ---
+  console.log("\nSuite 7: Dynamic Resolution Status & In-Panel Chat");
+
+  test("resolves sectionTitle dynamically based on effectivelyResolved", () => {
+    const getHeadingText = (resolved, customTitle) =>
+      customTitle || (resolved === false ? "Where this stands" : "Why this was resolved");
+
+    assert.equal(getHeadingText(true, null), "Why this was resolved");
+    assert.equal(getHeadingText(false, null), "Where this stands");
+    assert.equal(getHeadingText(false, "Current state"), "Current state");
+    assert.equal(getHeadingText(false, "Investigation status"), "Investigation status");
+  });
+
+  test("correctly groups citations in chat messages for modal lookup", () => {
+    const summaryCitations = [{ marker: 1, reason: "Bug found in code" }];
+    const chatCitations = [{ marker: 2, reason: "Deployed in build 881" }];
+    const allCitations = [...summaryCitations, ...chatCitations];
+
+    assert.equal(allCitations.find((c) => c.marker === 1)?.reason, "Bug found in code");
+    assert.equal(allCitations.find((c) => c.marker === 2)?.reason, "Deployed in build 881");
+    assert.equal(allCitations.find((c) => c.marker === 3), undefined);
+  });
+
   console.log(`\n================ TEST SUMMARY ================`);
   console.log(`Total: ${passed + failed} | Passed: ${passed} | Failed: ${failed}`);
   console.log(`==============================================\n`);

@@ -47,6 +47,8 @@ Thumbs.db
 *.flv
 *.mov
 *.wmv
+*.avif
+*.ico
 
 
 /.forge/
@@ -54,3 +56,5 @@ Thumbs.db
 # Internal project progress tracker (never commit to git)
 PROJECT_TRACKER.md
 
+assets/
+test-assets/
