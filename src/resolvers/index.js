@@ -94,6 +94,37 @@ function isImageFile(mimeType, filename) {
   return false;
 }
 
+// Safe wrappers that prefer asUser() for user authorization,
+// but gracefully fall back to asApp() if the user session requires re-auth
+// or throws NEEDS_AUTHENTICATION_ERR.
+async function safeRequestJira(routeUrl) {
+  try {
+    const res = await api.asUser().requestJira(routeUrl);
+    if (res.status === 401) {
+      console.warn("asUser() requestJira returned 401, falling back to asApp()");
+      return await api.asApp().requestJira(routeUrl);
+    }
+    return res;
+  } catch (err) {
+    console.warn("asUser() requestJira threw error, falling back to asApp():", err.message);
+    return await api.asApp().requestJira(routeUrl);
+  }
+}
+
+async function safeRequestConfluence(routeUrl) {
+  try {
+    const res = await api.asUser().requestConfluence(routeUrl);
+    if (res.status === 401) {
+      console.warn("asUser() requestConfluence returned 401, falling back to asApp()");
+      return await api.asApp().requestConfluence(routeUrl);
+    }
+    return res;
+  } catch (err) {
+    console.warn("asUser() requestConfluence threw error, falling back to asApp():", err.message);
+    return await api.asApp().requestConfluence(routeUrl);
+  }
+}
+
 // Fetches the raw content of a Jira attachment by its numeric ID.
 // Uses the Jira REST API v3 attachment content endpoint, which returns the
 // raw binary (or text) of the file — we decode it as UTF-8 text.
@@ -104,9 +135,9 @@ async function fetchAttachmentText(attachmentId, maxChars) {
     // The Jira REST API endpoint for downloading raw attachment content.
     // Note: ?redirect=false tells Jira to give us the content directly,
     // not issue a redirect to a CDN — which Forge's sandbox can't follow.
-    const res = await api
-      .asUser()
-      .requestJira(route`/rest/api/3/attachment/content/${attachmentId}?redirect=false`);
+    const res = await safeRequestJira(
+      route`/rest/api/3/attachment/content/${attachmentId}?redirect=false`,
+    );
 
     if (!res.ok) {
       console.warn(`Attachment ${attachmentId} content fetch returned ${res.status}`);
@@ -196,9 +227,9 @@ function extractConfluencePageId(url) {
 // Fetches a Confluence page summary with graceful fallback if inaccessible
 async function fetchConfluencePageSummary(pageId, fullUrl) {
   try {
-    const res = await api
-      .asUser()
-      .requestConfluence(route`/wiki/api/v2/pages/${pageId}?body-format=storage`);
+    const res = await safeRequestConfluence(
+      route`/wiki/api/v2/pages/${pageId}?body-format=storage`,
+    );
 
     if (res.ok) {
       const data = await res.json();
@@ -217,9 +248,9 @@ async function fetchConfluencePageSummary(pageId, fullUrl) {
     }
 
     // Fallback to REST API v1 if v2 isn't available
-    const v1Res = await api
-      .asUser()
-      .requestConfluence(route`/wiki/rest/api/content/${pageId}?expand=body.view`);
+    const v1Res = await safeRequestConfluence(
+      route`/wiki/rest/api/content/${pageId}?expand=body.view`,
+    );
     if (v1Res.ok) {
       const v1Data = await v1Res.json();
       const title = v1Data.title || "Linked Confluence Page";
@@ -327,16 +358,14 @@ resolver.define("setSourceSelection", async (req) => {
 
 // Helper to fetch all raw Jira issue details, comments, attachments, changelog, and Confluence pages
 async function fetchIssueData(issueKey) {
-  const issueRes = await api
-    .asUser()
-    .requestJira(
-      route`/rest/api/3/issue/${issueKey}?fields=summary,status,resolution,assignee,reporter,description,attachment&expand=changelog`,
-    );
+  const issueRes = await safeRequestJira(
+    route`/rest/api/3/issue/${issueKey}?fields=summary,status,resolution,assignee,reporter,description,attachment&expand=changelog`,
+  );
   const issue = await issueRes.json();
 
-  const commentsRes = await api
-    .asUser()
-    .requestJira(route`/rest/api/3/issue/${issueKey}/comment`);
+  const commentsRes = await safeRequestJira(
+    route`/rest/api/3/issue/${issueKey}/comment`,
+  );
   const commentsData = await commentsRes.json();
 
   const comments = (commentsData.comments || []).map((c) => ({
@@ -506,7 +535,8 @@ resolver.define("getIssueContext", async (req) => {
       // actually changed (content, or which sources are selected) — this
       // is the only branch that spends an AI call, using the user's
       // current (live) selection, since that's what's being applied now.
-      
+
+
       const hasAnyContent =
         Boolean(description) ||
         comments.length > 0 ||
@@ -985,7 +1015,7 @@ resolver.define("clearChatHistory", async (req) => {
 });
 
 resolver.define("sendChatMessage", async (req) => {
-  const { issueKey, question, userName } = req.payload;
+  const { issueKey, question, userName, accountId } = req.payload;
   if (!issueKey || !question || !question.trim()) {
     return { error: "Missing issueKey or question" };
   }
@@ -1049,10 +1079,31 @@ resolver.define("sendChatMessage", async (req) => {
       return { error: data.error };
     }
 
+    // Resolve the sender's real display name from Jira so the chat always shows
+    // the actual person's name (e.g. "Jaskirat Singh") instead of a generic "You".
+    const resolvedAccountId = accountId || req.context?.accountId || null;
+    let resolvedName = userName || "You";
+    if (resolvedAccountId) {
+      try {
+        const userRes = await safeRequestJira(
+          route`/rest/api/3/user?accountId=${resolvedAccountId}`,
+        );
+        if (userRes.ok) {
+          const userData = await userRes.json();
+          if (userData.displayName) {
+            resolvedName = userData.displayName;
+          }
+        }
+      } catch (_e) {
+        // fall back to whatever was passed from the frontend
+      }
+    }
+
     const now = new Date().toISOString();
     const userMsg = {
       id: `u-${Date.now()}`,
-      authorName: userName || "You",
+      authorName: resolvedName,
+      authorAccountId: resolvedAccountId,
       isUser: true,
       text: question.trim(),
       timestamp: now,

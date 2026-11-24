@@ -23,8 +23,12 @@ import ForgeReconciler, {
   Textfield,
   Spinner,
   Tooltip,
+  Form,
+  Image,
+  User,
 } from "@forge/react";
 import { invoke, view } from "@forge/bridge";
+import { RECUERDO_AVATAR } from "./avatar";
 
 // Display labels for each source category in the filter panel.
 const SOURCE_CATEGORY_LABELS = {
@@ -34,6 +38,39 @@ const SOURCE_CATEGORY_LABELS = {
   attachments: "Attachments",
   history: "Status changelog",
 };
+
+// Dynamic contextual suggested starter prompts tailored to the issue state
+function getSuggestedPrompts(context, issueKey) {
+  if (!context) {
+    return 'Try: "What was the root cause?" or "Who investigated this?"';
+  }
+
+  // Derive a stable seed from issue key so suggestions vary across issues
+  const seed = (issueKey || "").split("").reduce((acc, c) => acc + c.charCodeAt(0), 0);
+
+  // If issue is still under active investigation / open
+  if (context.effectivelyResolved === false) {
+    const openPool = [
+      'Try: "What is currently blocking resolution?" or "What were the latest findings?"',
+      'Try: "Who was the last person working on this?" or "What was ruled out so far?"',
+      'Try: "What error logs or stack traces were analyzed?" or "What are the recommended next steps?"',
+      'Try: "Where does the investigation stand?" or "Has this been reproduced locally?"',
+      'Try: "What was the last actor doing when activity stopped?" or "Who owns the next action?"',
+    ];
+    return openPool[seed % openPool.length];
+  }
+
+  // If issue was resolved / closed
+  const resolvedPool = [
+    'Try: "What was the root cause of the issue?" or "Who investigated and fixed this?"',
+    'Try: "Why was this specific fix chosen?" or "How was it verified in testing?"',
+    'Try: "What configuration or code was modified?" or "What logs were reviewed?"',
+    'Try: "Were any Confluence post-mortems or docs linked?" or "Who verified the fix?"',
+    'Try: "What were the symptoms before the fix?" or "What metrics confirmed recovery?"',
+    'Try: "Who authored the fix and who reviewed it?" or "What was the timeline to resolve?"',
+  ];
+  return resolvedPool[seed % resolvedPool.length];
+}
 
 // Per-source-type styling for inline citation markers: icon glyph plus a
 // distinct accent color, so each citation reads as a small colored pill
@@ -205,6 +242,21 @@ const App = () => {
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState("");
   const [isSendingChat, setIsSendingChat] = useState(false);
+  const [copiedMsgId, setCopiedMsgId] = useState(null);
+
+  const handleCopyMessage = useCallback((msgId, text) => {
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard) {
+        navigator.clipboard.writeText(text);
+      }
+    } catch (e) {
+      // ignore
+    }
+    setCopiedMsgId(msgId);
+    setTimeout(() => {
+      setCopiedMsgId((current) => (current === msgId ? null : current));
+    }, 2000);
+  }, []);
 
   const loadContext = useCallback((key, forceRefresh) => {
     return invoke("getIssueContext", { issueKey: key, forceRefresh }).then(
@@ -268,10 +320,11 @@ const App = () => {
     setChatInput("");
     setIsSendingChat(true);
 
-    // Optimistically add user message immediately
+    // Optimistically add user message immediately (with pfp accountId so the avatar shows right away)
     const tempUserMsg = {
       id: `temp-${Date.now()}`,
       authorName: "You",
+      authorAccountId: currentAccountId || null,
       isUser: true,
       text: question,
       timestamp: new Date().toISOString(),
@@ -282,6 +335,7 @@ const App = () => {
       issueKey,
       question,
       userName: "You",
+      accountId: currentAccountId,
     });
 
     if (res?.messages) {
@@ -364,7 +418,7 @@ const App = () => {
           iconBefore={isChatOpen ? "cross" : "comment"}
           onClick={() => setIsChatOpen((open) => !open)}
         >
-          {isChatOpen ? "✕ Close" : "Ask AI"}
+          {isChatOpen ? "Close" : "Ask AI"}
         </Button>
 
         <Inline space="space.075" alignBlock="center">
@@ -500,18 +554,7 @@ const App = () => {
           >
             <Stack space="space.150" padding="space.050">
 
-              {/* Empty state hint */}
-              {chatMessages.length === 0 && !isSendingChat && (
-                <Box
-                  padding="space.100"
-                  backgroundColor="elevation.surface.sunken"
-                  xcss={xcss({ borderRadius: "radius.medium" })}
-                >
-                  <Text color="color.text.subtlest">
-                    No questions asked yet. Try: "Who was investigating this?" or "Why was this timeout chosen?"
-                  </Text>
-                </Box>
-              )}
+
 
               {chatMessages.map((msg) => {
                 // Format timestamp for the tooltip label — shown on hover of avatar
@@ -536,39 +579,50 @@ const App = () => {
 
                 if (msg.isUser) {
                   // ── RIGHT-SIDE: user message ──
-                  // Layout: [Name  JS avatar]
-                  //         [     message card]
+                  // Desired layout: [Real Name text] ──spread── [pfp circle only]
+                  // The name now comes from the resolver which fetches it from Jira
+                  // (e.g. "Jaskirat Singh"). The pfp is on the far right.
                   const name = msg.authorName || "You";
                   const abbr = initials(name);
                   return (
                     <Stack key={msg.id} space="space.050" alignBlock="end">
-                      {/* Name + avatar row (right-aligned) */}
+                      {/* Name (left of the pfp) + pfp (rightmost) — spread pushes them apart */}
                       <Inline spread="end" space="space.075" alignBlock="center">
                         <Text size="small" color="color.text.subtle" weight="medium">
                           {name}
                         </Text>
-                        {/* Avatar circle with initials */}
-                        <Tooltip content={tooltipLabel || name} position="top">
-                          <Box
-                            backgroundColor="color.background.accent.blue.bolder"
-                            xcss={xcss({
-                              width: "28px",
-                              height: "28px",
-                              borderRadius: "50%",
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: "center",
-                              flexShrink: 0,
-                              cursor: "default",
-                            })}
-                          >
-                            <Text size="small" color="color.text.inverse" weight="bold">
-                              {abbr}
-                            </Text>
-                          </Box>
-                        </Tooltip>
+                        {/*
+                          Use Forge's <User> component to display the real Jira profile picture.
+                          hideDisplayName={true} shows ONLY the avatar circle, not the name text —
+                          we already render the name ourselves on the left.
+                          If there is no accountId, fall back to a subtle initials circle.
+                        */}
+                        {msg.authorAccountId ? (
+                          <Tooltip content={tooltipLabel || name} position="top">
+                            <User accountId={msg.authorAccountId} hideDisplayName={true} />
+                          </Tooltip>
+                        ) : (
+                          <Tooltip content={tooltipLabel || name} position="top">
+                            <Box
+                              backgroundColor="color.background.accent.blue.subtler"
+                              paddingBlock="space.025"
+                              paddingInline="space.075"
+                              xcss={xcss({
+                                borderRadius: "radius.full",
+                                borderStyle: "solid",
+                                borderWidth: "border.width",
+                                borderColor: "color.border.accent.blue",
+                                textAlign: "center",
+                              })}
+                            >
+                              <Text size="small" color="color.text.accent.blue.bolder" weight="bold">
+                                {abbr}
+                              </Text>
+                            </Box>
+                          </Tooltip>
+                        )}
                       </Inline>
-                      {/* Message bubble — right-aligned, same subtle bg as AI for consistency */}
+                      {/* Message bubble — right-aligned, subtle blue tint */}
                       <Inline spread="end">
                         <Box
                           backgroundColor="color.background.accent.blue.subtler"
@@ -586,37 +640,37 @@ const App = () => {
                 }
 
                 // ── LEFT-SIDE: Recuerdo AI message ──
-                // Layout: [R avatar  Recuerdo]
-                //         [message card      ]
+                // Layout: [logo circle] [Recuerdo text] — vertically centered by Inline alignBlock
                 return (
                   <Stack key={msg.id} space="space.050">
-                    {/* Avatar + "Recuerdo" label row */}
+                    {/*
+                      Header row. The Tooltip wraps only the avatar box so the text "Recuerdo"
+                      doesn't interfere with centering. We use space.300 (= 24px) design tokens
+                      for width/height so Forge's xcss engine applies them correctly.
+                    */}
                     <Inline space="space.075" alignBlock="center">
-                      {/* "R" avatar circle in teal */}
                       <Tooltip content={tooltipLabel || "Recuerdo"} position="top">
                         <Box
-                          backgroundColor="color.background.accent.teal.bolder"
                           xcss={xcss({
-                            width: "28px",
-                            height: "28px",
-                            borderRadius: "50%",
-                            display: "flex",
-                            alignItems: "center",
-                            justifyContent: "center",
-                            flexShrink: 0,
-                            cursor: "default",
+                            width: "space.300",
+                            height: "space.300",
+                            borderRadius: "radius.full",
                           })}
                         >
-                          <Text size="small" color="color.text.inverse" weight="bold">
-                            R
-                          </Text>
+                          <Image
+                            src={RECUERDO_AVATAR}
+                            alt="Recuerdo"
+                            size="small"
+                            width={24}
+                            height={24}
+                          />
                         </Box>
                       </Tooltip>
                       <Text size="small" color="color.text.subtle" weight="medium">
                         Recuerdo
                       </Text>
                     </Inline>
-                    {/* AI message card — slightly sunken bg, no border, rounded */}
+                    {/* AI message card — sunken bg, no border, rounded corners */}
                     <Box
                       backgroundColor="elevation.surface.sunken"
                       padding="space.100"
@@ -642,20 +696,23 @@ const App = () => {
               {isSendingChat && (
                 <Stack space="space.050">
                   <Inline space="space.075" alignBlock="center">
-                    <Box
-                      backgroundColor="color.background.accent.teal.bolder"
-                      xcss={xcss({
-                        width: "28px",
-                        height: "28px",
-                        borderRadius: "50%",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        flexShrink: 0,
-                      })}
-                    >
-                      <Text size="small" color="color.text.inverse" weight="bold">R</Text>
-                    </Box>
+                    <Tooltip content="Recuerdo" position="top">
+                      <Box
+                        xcss={xcss({
+                          width: "space.300",
+                          height: "space.300",
+                          borderRadius: "radius.full",
+                        })}
+                      >
+                        <Image
+                          src={RECUERDO_AVATAR}
+                          alt="Recuerdo"
+                          size="small"
+                          width={24}
+                          height={24}
+                        />
+                      </Box>
+                    </Tooltip>
                     <Text size="small" color="color.text.subtle" weight="medium">Recuerdo</Text>
                   </Inline>
                   <Box
@@ -676,26 +733,62 @@ const App = () => {
             </Stack>
           </Box>
 
-          {/* ── Chat input bar ── */}
-          <Inline space="space.050" alignBlock="center">
-            <Box xcss={xcss({ flexGrow: 1 })}>
-              <Textfield
-                placeholder="Your message to be sent here"
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleSendChatMessage();
-                }}
-                isDisabled={isSendingChat}
-              />
+          {/* ── Empty state hint — sits just above the input bar with dynamic suggestions ── */}
+          {chatMessages.length === 0 && !isSendingChat && (
+            <Box
+              padding="space.075"
+              xcss={xcss({ borderRadius: "radius.medium" })}
+            >
+              <Text size="small" color="color.text.subtlest">
+                No questions asked yet. {getSuggestedPrompts(context, issueKey)}
+              </Text>
             </Box>
-            <Button
-              appearance="primary"
-              iconBefore="send"
-              isDisabled={!chatInput.trim() || isSendingChat}
-              onClick={handleSendChatMessage}
-            />
-          </Inline>
+          )}
+
+          {/* ── Chat input bar with Enter key submit support ── */}
+          <Form onSubmit={handleSendChatMessage}>
+            <Inline space="space.075" alignBlock="center">
+              {/* Message box with 0 radius and pointy corners */}
+              <Box
+                backgroundColor="elevation.surface"
+                xcss={xcss({
+                  borderStyle: "solid",
+                  borderWidth: "border.width",
+                  borderColor: "color.border",
+                  flexGrow: 1,
+                })}
+              >
+                <Textfield
+                  name="chatInput"
+                  appearance="none"
+                  placeholder="Ask Recuerdo..."
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  isDisabled={isSendingChat}
+                />
+              </Box>
+              {/* Send button with 0 radius, pointy corners, and permanent white background */}
+              <Pressable
+                onClick={() => {
+                  if (!isSendingChat && chatInput.trim()) handleSendChatMessage();
+                }}
+                xcss={xcss({
+                  width: "36px",
+                  height: "36px",
+                  borderStyle: "solid",
+                  borderWidth: "border.width",
+                  borderColor: "color.border",
+                  backgroundColor: "elevation.surface",
+                  textAlign: "center",
+                  cursor: chatInput.trim() && !isSendingChat ? "pointer" : "default",
+                })}
+              >
+                <Inline alignBlock="center" alignInline="center">
+                  <Icon glyph="send" label="Send message" size="medium" />
+                </Inline>
+              </Pressable>
+            </Inline>
+          </Form>
 
           {/* ── Footer ── */}
           <Inline spread="space-between" alignBlock="center">
